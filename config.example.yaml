@@ -17,4 +17,15 @@ source:
 # Alternative: export to EML files instead of IMAP destination
 output_dir: "/home/hein/mail"
 
+# Optional: subdirectory in destination to preserve source structure
+# Example: "Archive" will create "Archive/INBOX", "Archive/Sent", etc.
+# subdirectory: "Archive"
+
+# Optional: date range filtering - only sync messages within these dates
+# Formats supported: YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, YYYY-MM-DD HH:MM:SS
+# date_from: "2024-01-01"        # Only sync messages from this date onwards
+# date_to: "2024-12-31"          # Only sync messages up to this date
+# date_from: "2024-06-01T00:00:00"  # With time specification
+# date_to: "2024-06-30T23:59:59"    # With time specification
+
 dry_run: false

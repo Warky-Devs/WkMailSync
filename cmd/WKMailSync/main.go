@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -16,8 +18,8 @@ import (
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/charset"
-	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/unicode"
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,10 +33,13 @@ type ServerConfig struct {
 }
 
 type Config struct {
-	Source    ServerConfig `yaml:"source"`
-	Dest      ServerConfig `yaml:"destination"`
-	OutputDir string       `yaml:"output_dir"`
-	DryRun    bool         `yaml:"dry_run"`
+	Source       ServerConfig `yaml:"source"`
+	Dest         ServerConfig `yaml:"destination"`
+	OutputDir    string       `yaml:"output_dir"`
+	DryRun       bool         `yaml:"dry_run"`
+	Subdirectory string       `yaml:"subdirectory"`
+	DateFrom     string       `yaml:"date_from"`
+	DateTo       string       `yaml:"date_to"`
 }
 
 type SyncStats struct {
@@ -46,12 +51,16 @@ type SyncStats struct {
 }
 
 type SyncTool struct {
-	source     *client.Client
-	dest       *client.Client
-	outputDir  string
-	stats      *SyncStats
-	srcConfig  ServerConfig
-	destConfig ServerConfig
+	source        *client.Client
+	dest          *client.Client
+	outputDir     string
+	stats         *SyncStats
+	srcConfig     ServerConfig
+	destConfig    ServerConfig
+	subdirectory  string
+	destSeparator string    // IMAP hierarchy separator for destination server
+	dateFrom      time.Time // Start date for filtering messages
+	dateTo        time.Time // End date for filtering messages
 }
 
 func init() {
@@ -61,13 +70,13 @@ func init() {
 	charset.RegisterEncoding("us-ascii", asciiEncoding)
 	charset.RegisterEncoding("ASCII", asciiEncoding)
 	charset.RegisterEncoding("US-ASCII", asciiEncoding)
-	
+
 	// Register Windows charsets
 	charset.RegisterEncoding("windows-1252", charmap.Windows1252)
 	charset.RegisterEncoding("WINDOWS-1252", charmap.Windows1252)
 	charset.RegisterEncoding("cp1252", charmap.Windows1252)
 	charset.RegisterEncoding("CP1252", charmap.Windows1252)
-	
+
 	// Register other common charsets
 	charset.RegisterEncoding("iso-8859-1", charmap.ISO8859_1)
 	charset.RegisterEncoding("ISO-8859-1", charmap.ISO8859_1)
@@ -92,14 +101,19 @@ func main() {
 		destTLS      = flag.Bool("dest-tls", true, "Use TLS for destination")
 		destInsecure = flag.Bool("dest-insecure", false, "Skip certificate verification for destination")
 
-		dryRun    = flag.Bool("dry-run", false, "Show what would be synced without actually doing it")
-		outputDir = flag.String("output-dir", "", "Output directory for EML files (alternative to IMAP destination)")
+		dryRun       = flag.Bool("dry-run", false, "Show what would be synced without actually doing it")
+		outputDir    = flag.String("output-dir", "", "Output directory for EML files (alternative to IMAP destination)")
+		subdirectory = flag.String("subdirectory", "", "Optional subdirectory in destination to preserve source structure (e.g., 'Archive')")
+		dateFrom     = flag.String("date-from", "", "Only sync messages from this date onwards (format: 2006-01-02 or 2006-01-02T15:04:05)")
+		dateTo       = flag.String("date-to", "", "Only sync messages up to this date (format: 2006-01-02 or 2006-01-02T15:04:05)")
 	)
 	flag.Parse()
 
 	var srcConfig, destConfig ServerConfig
 	var dryRunFlag bool
 	var outputDirFlag string
+	var subdirectoryFlag string
+	var dateFromFlag, dateToFlag string
 
 	// Load from config file if provided
 	if *configFile != "" {
@@ -111,6 +125,9 @@ func main() {
 		destConfig = config.Dest
 		dryRunFlag = config.DryRun
 		outputDirFlag = config.OutputDir
+		subdirectoryFlag = config.Subdirectory
+		dateFromFlag = config.DateFrom
+		dateToFlag = config.DateTo
 	} else {
 		// Use command line flags
 		if *srcHost == "" || *srcUser == "" || *srcPass == "" {
@@ -123,13 +140,41 @@ func main() {
 		destConfig = ServerConfig{*destHost, *destPort, *destUser, *destPass, *destTLS, *destInsecure}
 		dryRunFlag = *dryRun
 		outputDirFlag = *outputDir
+		subdirectoryFlag = *subdirectory
+		dateFromFlag = *dateFrom
+		dateToFlag = *dateTo
+	}
+
+	// Parse date ranges if provided
+	var dateFromParsed, dateToParsed time.Time
+	if dateFromFlag != "" {
+		var err error
+		dateFromParsed, err = parseDateString(dateFromFlag)
+		if err != nil {
+			log.Fatalf("Invalid date-from format: %v (use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)", err)
+		}
+	}
+	if dateToFlag != "" {
+		var err error
+		dateToParsed, err = parseDateString(dateToFlag)
+		if err != nil {
+			log.Fatalf("Invalid date-to format: %v (use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)", err)
+		}
+	}
+	
+	// Validate date range
+	if !dateFromParsed.IsZero() && !dateToParsed.IsZero() && dateFromParsed.After(dateToParsed) {
+		log.Fatalf("date-from cannot be after date-to")
 	}
 
 	syncer := &SyncTool{
-		outputDir:  outputDirFlag,
-		stats:      &SyncStats{},
-		srcConfig:  srcConfig,
-		destConfig: destConfig,
+		outputDir:    outputDirFlag,
+		stats:        &SyncStats{},
+		srcConfig:    srcConfig,
+		destConfig:   destConfig,
+		subdirectory: subdirectoryFlag,
+		dateFrom:     dateFromParsed,
+		dateTo:       dateToParsed,
 	}
 
 	// Connect to source server
@@ -147,6 +192,24 @@ func main() {
 			log.Fatalf("Failed to connect to destination: %v", err)
 		}
 		defer syncer.dest.Logout()
+		
+		// Detect IMAP hierarchy separator for subdirectory feature
+		if syncer.subdirectory != "" {
+			if err := syncer.detectDestinationSeparator(); err != nil {
+				log.Fatalf("Failed to detect destination separator: %v", err)
+			}
+		}
+	}
+
+	// Log sync configuration
+	if !syncer.dateFrom.IsZero() || !syncer.dateTo.IsZero() {
+		log.Printf("Date filtering enabled:")
+		if !syncer.dateFrom.IsZero() {
+			log.Printf("  From: %s", syncer.dateFrom.Format("2006-01-02 15:04:05"))
+		}
+		if !syncer.dateTo.IsZero() {
+			log.Printf("  To: %s", syncer.dateTo.Format("2006-01-02 15:04:05"))
+		}
 	}
 
 	// Sync all mailboxes
@@ -259,7 +322,106 @@ func (s *SyncTool) reconnectDest() error {
 		return fmt.Errorf("failed to reconnect to destination: %v", err)
 	}
 	log.Printf("Successfully reconnected to destination")
+	
+	// Re-detect separator after reconnection if using subdirectory
+	if s.subdirectory != "" {
+		s.destSeparator = "" // Reset to force re-detection
+		if err := s.detectDestinationSeparator(); err != nil {
+			return fmt.Errorf("failed to re-detect destination separator: %v", err)
+		}
+	}
+	
 	return nil
+}
+
+func (s *SyncTool) detectDestinationSeparator() error {
+	if s.dest == nil || s.destSeparator != "" {
+		return nil // Already detected or not needed
+	}
+
+	// Use LIST command to detect hierarchy separator
+	mailboxes := make(chan *imap.MailboxInfo, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- s.dest.List("", "", mailboxes)
+	}()
+
+	// Get the first mailbox info which contains the separator
+	for m := range mailboxes {
+		s.destSeparator = m.Delimiter
+		break
+	}
+
+	if err := <-done; err != nil {
+		return fmt.Errorf("failed to detect hierarchy separator: %v", err)
+	}
+
+	// Default to "/" if no separator detected
+	if s.destSeparator == "" {
+		s.destSeparator = "/"
+	}
+
+	log.Printf("Detected destination IMAP hierarchy separator: %q", s.destSeparator)
+	return nil
+}
+
+func (s *SyncTool) buildDestinationMailboxPath(sourceMailboxName string) string {
+	if s.subdirectory == "" {
+		return sourceMailboxName
+	}
+
+	// Use the detected separator for the destination server
+	// For example with "/": "INBOX" -> "Archive/INBOX"
+	// For example with ".": "INBOX" -> "Archive.INBOX"
+	return s.subdirectory + s.destSeparator + sourceMailboxName
+}
+
+func parseDateString(dateStr string) (time.Time, error) {
+	// Try different date formats
+	formats := []string{
+		"2006-01-02",                // YYYY-MM-DD
+		"2006-01-02T15:04:05",       // YYYY-MM-DDTHH:MM:SS
+		"2006-01-02 15:04:05",       // YYYY-MM-DD HH:MM:SS
+		"2006-01-02T15:04:05Z07:00", // RFC3339
+		"2006-01-02T15:04:05Z",      // UTC
+	}
+	
+	for _, format := range formats {
+		if parsed, err := time.Parse(format, dateStr); err == nil {
+			return parsed, nil
+		}
+	}
+	
+	return time.Time{}, fmt.Errorf("unable to parse date %q", dateStr)
+}
+
+func (s *SyncTool) shouldProcessMessage(msg *imap.Message) (bool, string) {
+	// If no date filters are set, process all messages
+	if s.dateFrom.IsZero() && s.dateTo.IsZero() {
+		return true, ""
+	}
+	
+	// Get message date - prefer InternalDate, fallback to envelope Date
+	msgDate := msg.InternalDate
+	if msgDate.IsZero() && msg.Envelope != nil && !msg.Envelope.Date.IsZero() {
+		msgDate = msg.Envelope.Date
+	}
+	
+	// Skip messages without valid dates if date filtering is enabled
+	if msgDate.IsZero() {
+		return false, "no valid date found"
+	}
+	
+	// Check date range
+	if !s.dateFrom.IsZero() && msgDate.Before(s.dateFrom) {
+		return false, fmt.Sprintf("message date %s is before range start %s", msgDate.Format("2006-01-02"), s.dateFrom.Format("2006-01-02"))
+	}
+	
+	if !s.dateTo.IsZero() && msgDate.After(s.dateTo) {
+		return false, fmt.Sprintf("message date %s is after range end %s", msgDate.Format("2006-01-02"), s.dateTo.Format("2006-01-02"))
+	}
+	
+	return true, ""
 }
 
 func sanitizeFilename(input string) string {
@@ -330,6 +492,9 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 		return fmt.Errorf("destination connection failed: %v", err)
 	}
 
+	// Build destination mailbox path (with optional subdirectory)
+	destMailboxName := s.buildDestinationMailboxPath(mailboxName)
+
 	// Select source mailbox
 	srcMbox, err := s.source.Select(mailboxName, true) // read-only
 	if err != nil {
@@ -351,13 +516,13 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 	if s.outputDir == "" {
 		// IMAP destination mode
 		if !dryRun {
-			s.dest.Create(mailboxName) // Ignore error if it already exists
+			s.dest.Create(destMailboxName) // Ignore error if it already exists
 		}
 
-		destMbox, err = s.dest.Select(mailboxName, false)
+		destMbox, err = s.dest.Select(destMailboxName, false)
 		if err != nil {
 			if !dryRun {
-				return fmt.Errorf("failed to select destination mailbox: %v", err)
+				return fmt.Errorf("failed to select destination mailbox %s: %v", destMailboxName, err)
 			}
 			destMbox = &imap.MailboxStatus{Messages: 0}
 		}
@@ -366,20 +531,28 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 			seqset := new(imap.SeqSet)
 			seqset.AddRange(1, destMbox.Messages)
 
-			messages := make(chan *imap.Message, 10)
+			messages := make(chan *imap.Message, int(destMbox.Messages)+10) // Buffer for all destination messages
 			done := make(chan error, 1)
 			go func() {
 				done <- s.dest.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope}, messages)
 			}()
 
+			// Collect all destination messages first
+			var destMessages []*imap.Message
 			for msg := range messages {
+				destMessages = append(destMessages, msg)
+			}
+
+			// Wait for fetch to complete
+			if err := <-done; err != nil {
+				return fmt.Errorf("failed to fetch destination messages: %v", err)
+			}
+
+			// Now process all destination messages
+			for _, msg := range destMessages {
 				if msg.Envelope != nil && msg.Envelope.MessageId != "" {
 					destMessageIDs[msg.Envelope.MessageId] = true
 				}
-			}
-
-			if err := <-done; err != nil {
-				return fmt.Errorf("failed to fetch destination messages: %v", err)
 			}
 		}
 	} else {
@@ -432,7 +605,7 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 		seqset.AddRange(start, end)
 
 		log.Printf("  Downloading batch %s\n", seqset.String())
-		messages := make(chan *imap.Message, 10)
+		messages := make(chan *imap.Message, int(end-start+1)+10) // Buffer for all messages in batch
 		done := make(chan error, 1)
 		go func() {
 			done <- s.source.Fetch(seqset, []imap.FetchItem{
@@ -443,15 +616,56 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 			}, messages)
 		}()
 
+		// Collect all messages first to avoid deadlock
+		var msgBatch []*imap.Message
 		for msg := range messages {
-			if msg.Envelope == nil || msg.Envelope.MessageId == "" {
-				log.Printf("  Skipping message without Message-ID")
+			msgBatch = append(msgBatch, msg)
+		}
+
+		// Wait for fetch to complete
+		if err := <-done; err != nil {
+			return fmt.Errorf("failed to fetch source messages: %v", err)
+		}
+
+		// Now process all messages without blocking the fetch goroutine
+		for _, msg := range msgBatch {
+			if msg.Envelope == nil {
+				log.Printf("  Skipping message with nil envelope (SeqNum: %d)", msg.SeqNum)
 				skipped++
 				s.stats.SkippedMessages++
 				continue
 			}
-
+			
+			// Check if message should be processed based on date range
+			if shouldProcess, reason := s.shouldProcessMessage(msg); !shouldProcess {
+				log.Printf("  Skipping message (SeqNum: %d): %s", msg.SeqNum, reason)
+				skipped++
+				s.stats.SkippedMessages++
+				continue
+			}
+			
+			// Generate fallback Message-ID for messages without one
 			messageID := msg.Envelope.MessageId
+			if messageID == "" {
+				// Create a fallback Message-ID using subject, date, and sequence
+				date := msg.InternalDate
+				if date.IsZero() && !msg.Envelope.Date.IsZero() {
+					date = msg.Envelope.Date
+				}
+				if date.IsZero() {
+					date = time.Now()
+				}
+				
+				subject := msg.Envelope.Subject
+				if subject == "" {
+					subject = "(no subject)"
+				}
+				
+				// Generate unique ID: hash of subject + date + sequence number
+				h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d-%d", subject, date.Unix(), msg.SeqNum)))
+				messageID = fmt.Sprintf("<%x@wkmailsync.generated>", h[:8])
+				log.Printf("  Generated Message-ID for message without one: %s (Subject: %q)", messageID, subject)
+			}
 
 			// Create filename for file output mode
 			var filename string
@@ -513,7 +727,7 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 				}
 				destMessageIDs[filename] = true
 			} else {
-				if err := s.copyMessageWithRetry(msg, mailboxName, messageID); err != nil {
+				if err := s.copyMessageWithRetry(msg, destMailboxName, messageID); err != nil {
 					log.Printf("  Failed to copy message %s after retries: %v", messageID, err)
 					s.stats.Errors++
 					continue
@@ -523,10 +737,6 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 
 			copied++
 			s.stats.CopiedMessages++
-		}
-
-		if err := <-done; err != nil {
-			return fmt.Errorf("failed to fetch source messages: %v", err)
 		}
 	}
 
@@ -567,16 +777,20 @@ func (s *SyncTool) copyMessage(msg *imap.Message, mailboxName string) error {
 		return fmt.Errorf("no valid body section found")
 	}
 
+	// Read the entire message body into memory first to avoid consumption issues
+	var msgContent bytes.Buffer
+	if _, err := io.Copy(&msgContent, msgBody); err != nil {
+		return fmt.Errorf("failed to read message body: %v", err)
+	}
+	
 	// Parse the message with charset fallback
-	entity, err := parseMessageWithFallback(msgBody, msg.Envelope.MessageId)
+	entity, err := parseMessageWithFallback(bytes.NewReader(msgContent.Bytes()), msg.Envelope.MessageId)
 	var buf strings.Builder
 
 	if err != nil && strings.Contains(err.Error(), "charset_error") {
-		// Charset error - copy raw content without parsing
-		log.Printf("  Using raw copy for message %s due to charset issues", msg.Envelope.MessageId)
-		if _, err := io.Copy(&buf, msgBody); err != nil {
-			return fmt.Errorf("failed to copy raw message: %v", err)
-		}
+		// Parsing error (charset, MIME, etc.) - use raw content
+		log.Printf("  Using raw copy for message %s due to parsing issues", msg.Envelope.MessageId)
+		buf.Write(msgContent.Bytes())
 	} else if err != nil {
 		return fmt.Errorf("failed to parse message: %v", err)
 	} else {
@@ -672,8 +886,14 @@ func (s *SyncTool) saveMessageToFile(msg *imap.Message, mailboxName, filename st
 		return fmt.Errorf("no valid body section found")
 	}
 
+	// Read the entire message body into memory first
+	var msgContent bytes.Buffer
+	if _, err := io.Copy(&msgContent, msgBody); err != nil {
+		return fmt.Errorf("failed to read message body: %v", err)
+	}
+	
 	// Parse the message with charset fallback
-	entity, err := parseMessageWithFallback(msgBody, msg.Envelope.MessageId)
+	entity, parseErr := parseMessageWithFallback(bytes.NewReader(msgContent.Bytes()), msg.Envelope.MessageId)
 
 	// Create the full file path
 	mailboxDir := filepath.Join(s.outputDir, sanitizeFilename(mailboxName))
@@ -687,14 +907,14 @@ func (s *SyncTool) saveMessageToFile(msg *imap.Message, mailboxName, filename st
 	defer file.Close()
 
 	// Write the message content to file
-	if err != nil && strings.Contains(err.Error(), "charset_error") {
-		// Charset error - copy raw content without parsing
-		log.Printf("  Using raw copy for file %s due to charset issues", filename)
-		if _, err := io.Copy(file, msgBody); err != nil {
+	if parseErr != nil && strings.Contains(parseErr.Error(), "charset_error") {
+		// Parsing error (charset, MIME, etc.) - use raw content
+		log.Printf("  Using raw copy for file %s due to parsing issues", filename)
+		if _, err := file.Write(msgContent.Bytes()); err != nil {
 			return fmt.Errorf("failed to copy raw message to file: %v", err)
 		}
-	} else if err != nil {
-		return fmt.Errorf("failed to parse message: %v", err)
+	} else if parseErr != nil {
+		return fmt.Errorf("failed to parse message: %v", parseErr)
 	} else {
 		// Normal parsing successful
 		if err := entity.WriteTo(file); err != nil {
@@ -715,12 +935,19 @@ func parseMessageWithFallback(msgBody io.Reader, messageID string) (*message.Ent
 	// Check if it's a charset error
 	if strings.Contains(err.Error(), "charset") || strings.Contains(err.Error(), "unknown charset") {
 		log.Printf("  Charset error for message %s, attempting raw copy: %v", messageID, err)
-
-		// For charset errors, we'll skip parsing and return nil
-		// The calling function should handle raw copying
 		return nil, fmt.Errorf("charset_error: %w", err)
 	}
 
-	// Other errors, return as-is
-	return nil, err
+	// Check if it's a MIME parsing error (malformed headers, etc.)
+	if strings.Contains(err.Error(), "malformed MIME") ||
+		strings.Contains(err.Error(), "malformed header") ||
+		strings.Contains(err.Error(), "invalid header") ||
+		strings.Contains(err.Error(), "bad header") {
+		log.Printf("  MIME parsing error for message %s, attempting raw copy: %v", messageID, err)
+		return nil, fmt.Errorf("charset_error: %w", err) // Use same error type for consistency
+	}
+
+	// Other parsing errors - also try raw copy as fallback
+	log.Printf("  Message parsing error for message %s, attempting raw copy: %v", messageID, err)
+	return nil, fmt.Errorf("charset_error: %w", err)
 }
