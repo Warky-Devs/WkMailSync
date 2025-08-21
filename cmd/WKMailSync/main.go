@@ -15,6 +15,9 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message"
+	"github.com/emersion/go-message/charset"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/encoding/charmap"
 	"gopkg.in/yaml.v3"
 )
 
@@ -43,10 +46,33 @@ type SyncStats struct {
 }
 
 type SyncTool struct {
-	source    *client.Client
-	dest      *client.Client
-	outputDir string
-	stats     *SyncStats
+	source     *client.Client
+	dest       *client.Client
+	outputDir  string
+	stats      *SyncStats
+	srcConfig  ServerConfig
+	destConfig ServerConfig
+}
+
+func init() {
+	// Register additional charsets
+	asciiEncoding := unicode.UTF8 // ASCII is compatible with UTF-8
+	charset.RegisterEncoding("ascii", asciiEncoding)
+	charset.RegisterEncoding("us-ascii", asciiEncoding)
+	charset.RegisterEncoding("ASCII", asciiEncoding)
+	charset.RegisterEncoding("US-ASCII", asciiEncoding)
+	
+	// Register Windows charsets
+	charset.RegisterEncoding("windows-1252", charmap.Windows1252)
+	charset.RegisterEncoding("WINDOWS-1252", charmap.Windows1252)
+	charset.RegisterEncoding("cp1252", charmap.Windows1252)
+	charset.RegisterEncoding("CP1252", charmap.Windows1252)
+	
+	// Register other common charsets
+	charset.RegisterEncoding("iso-8859-1", charmap.ISO8859_1)
+	charset.RegisterEncoding("ISO-8859-1", charmap.ISO8859_1)
+	charset.RegisterEncoding("latin1", charmap.ISO8859_1)
+	charset.RegisterEncoding("LATIN1", charmap.ISO8859_1)
 }
 
 func main() {
@@ -100,8 +126,10 @@ func main() {
 	}
 
 	syncer := &SyncTool{
-		outputDir: outputDirFlag,
-		stats:     &SyncStats{},
+		outputDir:  outputDirFlag,
+		stats:      &SyncStats{},
+		srcConfig:  srcConfig,
+		destConfig: destConfig,
 	}
 
 	// Connect to source server
@@ -180,6 +208,60 @@ func loadConfig(filename string) (*Config, error) {
 	return &config, nil
 }
 
+func (s *SyncTool) ensureSourceConnection() error {
+	if s.source == nil {
+		return s.reconnectSource()
+	}
+
+	// Test connection with NOOP
+	if err := s.source.Noop(); err != nil {
+		log.Printf("Source connection lost, reconnecting: %v", err)
+		return s.reconnectSource()
+	}
+	return nil
+}
+
+func (s *SyncTool) ensureDestConnection() error {
+	if s.dest == nil || s.outputDir != "" {
+		return nil // No destination needed for file output
+	}
+
+	// Test connection with NOOP
+	if err := s.dest.Noop(); err != nil {
+		log.Printf("Destination connection lost, reconnecting: %v", err)
+		return s.reconnectDest()
+	}
+	return nil
+}
+
+func (s *SyncTool) reconnectSource() error {
+	if s.source != nil {
+		s.source.Logout()
+	}
+
+	var err error
+	s.source, err = connect(s.srcConfig)
+	if err != nil {
+		return fmt.Errorf("failed to reconnect to source: %v", err)
+	}
+	log.Printf("Successfully reconnected to source")
+	return nil
+}
+
+func (s *SyncTool) reconnectDest() error {
+	if s.dest != nil {
+		s.dest.Logout()
+	}
+
+	var err error
+	s.dest, err = connect(s.destConfig)
+	if err != nil {
+		return fmt.Errorf("failed to reconnect to destination: %v", err)
+	}
+	log.Printf("Successfully reconnected to destination")
+	return nil
+}
+
 func sanitizeFilename(input string) string {
 	// Remove or replace invalid filename characters
 	invalidChars := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
@@ -240,6 +322,14 @@ func (s *SyncTool) syncAll(dryRun bool) error {
 }
 
 func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
+	// Ensure connections are alive
+	if err := s.ensureSourceConnection(); err != nil {
+		return fmt.Errorf("source connection failed: %v", err)
+	}
+	if err := s.ensureDestConnection(); err != nil {
+		return fmt.Errorf("destination connection failed: %v", err)
+	}
+
 	// Select source mailbox
 	srcMbox, err := s.source.Select(mailboxName, true) // read-only
 	if err != nil {
@@ -326,6 +416,18 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 			end = srcMbox.Messages
 		}
 
+		// Periodic connection check every 10 batches
+		if (start-1)/batchSize%10 == 0 && start > 1 {
+			if err := s.ensureSourceConnection(); err != nil {
+				log.Printf("Source connection check failed: %v", err)
+				continue
+			}
+			if err := s.ensureDestConnection(); err != nil {
+				log.Printf("Destination connection check failed: %v", err)
+				continue
+			}
+		}
+
 		seqset := new(imap.SeqSet)
 		seqset.AddRange(start, end)
 
@@ -350,11 +452,11 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 			}
 
 			messageID := msg.Envelope.MessageId
-			log.Printf("  Processing Message %s\n", messageID)
 
 			// Create filename for file output mode
 			var filename string
 			if s.outputDir != "" {
+
 				date := msg.InternalDate
 				if date.IsZero() && !msg.Envelope.Date.IsZero() {
 					date = msg.Envelope.Date
@@ -389,6 +491,7 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 					continue
 				}
 			}
+			log.Printf("  Processing Message %s\n", messageID)
 
 			if dryRun {
 				if s.outputDir != "" {
@@ -401,7 +504,7 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 				continue
 			}
 
-			// Copy/save message
+			// Copy/save message with retry
 			if s.outputDir != "" {
 				if err := s.saveMessageToFile(msg, mailboxName, filename); err != nil {
 					log.Printf("  Failed to save message %s: %v", filename, err)
@@ -410,12 +513,11 @@ func (s *SyncTool) syncMailbox(mailboxName string, dryRun bool) error {
 				}
 				destMessageIDs[filename] = true
 			} else {
-				if err := s.copyMessage(msg, mailboxName); err != nil {
-					log.Printf("  Failed to copy message %s: %v", messageID, err)
+				if err := s.copyMessageWithRetry(msg, mailboxName, messageID); err != nil {
+					log.Printf("  Failed to copy message %s after retries: %v", messageID, err)
 					s.stats.Errors++
 					continue
 				}
-
 				destMessageIDs[messageID] = true
 			}
 
@@ -450,7 +552,7 @@ func (s *SyncTool) copyMessage(msg *imap.Message, mailboxName string) error {
 			break
 		}
 	}
-	
+
 	// If no text section found, try any available body section
 	if msgBody == nil {
 		for _, body := range msg.Body {
@@ -465,16 +567,23 @@ func (s *SyncTool) copyMessage(msg *imap.Message, mailboxName string) error {
 		return fmt.Errorf("no valid body section found")
 	}
 
-	// Parse the message
-	entity, err := message.Read(msgBody)
-	if err != nil {
-		return fmt.Errorf("failed to parse message: %v", err)
-	}
-
-	// Get the raw message content
+	// Parse the message with charset fallback
+	entity, err := parseMessageWithFallback(msgBody, msg.Envelope.MessageId)
 	var buf strings.Builder
-	if err := entity.WriteTo(&buf); err != nil {
-		return fmt.Errorf("failed to write message: %v", err)
+
+	if err != nil && strings.Contains(err.Error(), "charset_error") {
+		// Charset error - copy raw content without parsing
+		log.Printf("  Using raw copy for message %s due to charset issues", msg.Envelope.MessageId)
+		if _, err := io.Copy(&buf, msgBody); err != nil {
+			return fmt.Errorf("failed to copy raw message: %v", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to parse message: %v", err)
+	} else {
+		// Normal parsing successful
+		if err := entity.WriteTo(&buf); err != nil {
+			return fmt.Errorf("failed to write message: %v", err)
+		}
 	}
 
 	// Append to destination mailbox
@@ -487,6 +596,46 @@ func (s *SyncTool) copyMessage(msg *imap.Message, mailboxName string) error {
 	log.Printf("  Copy Message %s\n", msg.Envelope.MessageId)
 
 	return s.dest.Append(mailboxName, flags, date, strings.NewReader(buf.String()))
+}
+
+func (s *SyncTool) copyMessageWithRetry(msg *imap.Message, mailboxName, messageID string) error {
+	const maxRetries = 3
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if attempt > 1 {
+			log.Printf("  Retry %d/%d for message %s", attempt, maxRetries, messageID)
+			// Ensure connections are alive before retry
+			if err := s.ensureDestConnection(); err != nil {
+				log.Printf("  Connection check failed on retry %d: %v", attempt, err)
+				continue
+			}
+		}
+
+		err := s.copyMessage(msg, mailboxName)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("  Successfully copied message %s on retry %d", messageID, attempt)
+			}
+			return nil
+		}
+
+		// Check if it's a connection-related error
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "not logged in") ||
+			strings.Contains(errStr, "connection") ||
+			strings.Contains(errStr, "timeout") {
+			log.Printf("  Connection error on attempt %d: %v", attempt, err)
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt) * time.Second) // Backoff
+				continue
+			}
+		}
+
+		// Non-retryable error or max retries exceeded
+		return err
+	}
+
+	return fmt.Errorf("failed after %d attempts", maxRetries)
 }
 
 func (s *SyncTool) saveMessageToFile(msg *imap.Message, mailboxName, filename string) error {
@@ -508,7 +657,7 @@ func (s *SyncTool) saveMessageToFile(msg *imap.Message, mailboxName, filename st
 			break
 		}
 	}
-	
+
 	// If no text section found, try any available body section
 	if msgBody == nil {
 		for _, body := range msg.Body {
@@ -523,27 +672,55 @@ func (s *SyncTool) saveMessageToFile(msg *imap.Message, mailboxName, filename st
 		return fmt.Errorf("no valid body section found")
 	}
 
-	// Parse the message
-	entity, err := message.Read(msgBody)
-	if err != nil {
-		return fmt.Errorf("failed to parse message: %v", err)
-	}
+	// Parse the message with charset fallback
+	entity, err := parseMessageWithFallback(msgBody, msg.Envelope.MessageId)
 
 	// Create the full file path
 	mailboxDir := filepath.Join(s.outputDir, sanitizeFilename(mailboxName))
 	filePath := filepath.Join(mailboxDir, filename)
 
 	// Create the file
-	file, err := os.Create(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to create file: %v", err)
+	file, err2 := os.Create(filePath)
+	if err2 != nil {
+		return fmt.Errorf("failed to create file: %v", err2)
 	}
 	defer file.Close()
 
-	// Write the raw message content to file
-	if err := entity.WriteTo(file); err != nil {
-		return fmt.Errorf("failed to write message to file: %v", err)
+	// Write the message content to file
+	if err != nil && strings.Contains(err.Error(), "charset_error") {
+		// Charset error - copy raw content without parsing
+		log.Printf("  Using raw copy for file %s due to charset issues", filename)
+		if _, err := io.Copy(file, msgBody); err != nil {
+			return fmt.Errorf("failed to copy raw message to file: %v", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to parse message: %v", err)
+	} else {
+		// Normal parsing successful
+		if err := entity.WriteTo(file); err != nil {
+			return fmt.Errorf("failed to write message to file: %v", err)
+		}
 	}
 
 	return nil
+}
+
+func parseMessageWithFallback(msgBody io.Reader, messageID string) (*message.Entity, error) {
+	// First attempt: normal parsing
+	entity, err := message.Read(msgBody)
+	if err == nil {
+		return entity, nil
+	}
+
+	// Check if it's a charset error
+	if strings.Contains(err.Error(), "charset") || strings.Contains(err.Error(), "unknown charset") {
+		log.Printf("  Charset error for message %s, attempting raw copy: %v", messageID, err)
+
+		// For charset errors, we'll skip parsing and return nil
+		// The calling function should handle raw copying
+		return nil, fmt.Errorf("charset_error: %w", err)
+	}
+
+	// Other errors, return as-is
+	return nil, err
 }
