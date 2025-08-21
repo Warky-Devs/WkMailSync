@@ -1,0 +1,20 @@
+source:
+  host: "mail.example.com"
+  port: "993"
+  username: "test@test"
+  password: "test"
+  use_tls: true
+  insecure_tls: true
+
+# destination:
+#   host: "mail.example.com"
+#   port: "993"
+#   username: "mail.example.com"
+#   password: "asdasd"
+#   use_tls: true
+#   insecure_tls: true
+
+# Alternative: export to EML files instead of IMAP destination
+output_dir: "/home/hein/mail"
+
+dry_run: false
