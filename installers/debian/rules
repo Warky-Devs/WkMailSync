@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+export DH_VERBOSE = 1
+export GOPATH = $(CURDIR)/_build/go
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	go build -trimpath \
+		-ldflags "-s -w" \
+		-o WKMailSync ./cmd/WKMailSync
+
+override_dh_auto_install:
+	install -Dm755 WKMailSync debian/wkmailsync/usr/bin/WKMailSync
+
+override_dh_auto_test:
