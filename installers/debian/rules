@@ -8,9 +8,9 @@ export GOPATH = $(CURDIR)/_build/go
 override_dh_auto_build:
 	go build -trimpath \
 		-ldflags "-s -w" \
-		-o WKMailSync ./cmd/WKMailSync
+		-o wkmailsync ./cmd/wkmailsync
 
 override_dh_auto_install:
-	install -Dm755 WKMailSync debian/wkmailsync/usr/bin/WKMailSync
+	install -Dm755 wkmailsync debian/wkmailsync/usr/bin/wkmailsync
 
 override_dh_auto_test:

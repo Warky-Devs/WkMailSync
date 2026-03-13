@@ -1,5 +1,5 @@
 # Maintainer: Hein Puth (Warky Devs)
-Name:           WKMailSync
+Name:           wkmailsync
 Version:        1.0.3
 Release:        1%{?dist}
 Summary:        Mail synchronization and backup tool - IMAP/Maildir sync and export
@@ -14,13 +14,13 @@ Mail synchronization and backup tool supporting IMAP/Maildir sync and export.
 Supports IMAP-to-IMAP, IMAP-to-EML, Maildir-to-EML/Zip, and Virtualmin bulk export.
 
 %prep
-%autosetup -n WkMailSync-%{version}
+%autosetup -n wkmailsync-%{version}
 
 %build
 export GOPATH=%{_builddir}/go
 go build -trimpath \
     -ldflags "-s -w" \
-    -o %{name} ./cmd/WKMailSync
+    -o %{name} ./cmd/wkmailsync
 
 %install
 install -Dm755 %{name} %{buildroot}%{_bindir}/%{name}

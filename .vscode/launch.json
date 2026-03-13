@@ -9,8 +9,8 @@
             "type": "go",
             "request": "launch",
             "mode": "auto",
-            "program": "${workspaceFolder}/cmd/WKMailSync",
-            "output": "${workspaceFolder}/bin/WKMailSync",
+            "program": "${workspaceFolder}/cmd/wkmailsync",
+            "output": "${workspaceFolder}/bin/wkmailsync",
             "args": [
                 "-config",
                 "${workspaceFolder}/temp/config.example.yaml"
@@ -21,7 +21,7 @@
             "type": "go",
             "request": "launch",
             "mode": "exec",
-            "program": "${workspaceFolder}/bin/WKMailSync",
+            "program": "${workspaceFolder}/bin/wkmailsync",
             "args": [
                 "-config",
                 "${workspaceFolder}/temp/config.example.yaml"

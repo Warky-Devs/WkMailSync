@@ -4,7 +4,7 @@
         {
             "label": "Build",
             "type": "shell",
-            "command": "go build -o ${workspaceFolder}/bin/WKMailSync ${workspaceFolder}/cmd/WKMailSync",
+            "command": "go build -o ${workspaceFolder}/bin/wkmailsync ${workspaceFolder}/cmd/wkmailsync",
             "group": {
                 "kind": "build",
                 "isDefault": true

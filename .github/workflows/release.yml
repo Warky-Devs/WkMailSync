@@ -27,7 +27,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.21' # Adjust to your Go version
+        go-version: '1.22'
         check-latest: true
     
     - name: Get dependencies
@@ -54,7 +54,7 @@ jobs:
         )
         
         # Set the application name
-        APP_NAME="WKMailSync"
+        APP_NAME="wkmailsync"
         
         for target in "${targets[@]}"; do
           OS=$(echo $target | cut -d'/' -f1)
@@ -72,7 +72,7 @@ jobs:
           CGO_ENABLED=0 GOOS=$OS GOARCH=$ARCH go build \
             -ldflags="-s -w -X 'main.version=${{ steps.tag.outputs.tag }}' " \
             -o "dist/${BINARY_NAME}" \
-            ./cmd/WKMailSync
+            ./cmd/wkmailsync
           
           # Create compressed archive
           if [ "$OS" = "windows" ]; then
