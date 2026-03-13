@@ -3,6 +3,8 @@ package connector
 import (
 	"fmt"
 	"io"
+	"iter"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -35,22 +37,33 @@ func NewSSHConnector(cfg *config.VirtualminConfig) (*SSHConnector, error) {
 		port = "22"
 	}
 
+	addr := fmt.Sprintf("%s:%s", sshCfg.Host, port)
+	log.Printf("[ssh] Connecting to %s as %s", addr, sshCfg.Username)
+	if sshCfg.KeyFile != "" {
+		log.Printf("[ssh] Using key file: %s", sshCfg.KeyFile)
+	} else {
+		log.Printf("[ssh] Using password authentication")
+	}
+
 	clientCfg := &gossh.ClientConfig{
 		User:            sshCfg.Username,
 		Auth:            authMethods,
 		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
 	}
 
-	client, err := gossh.Dial("tcp", fmt.Sprintf("%s:%s", sshCfg.Host, port), clientCfg)
+	client, err := gossh.Dial("tcp", addr, clientCfg)
 	if err != nil {
 		return nil, fmt.Errorf("SSH dial failed: %v", err)
 	}
+	log.Printf("[ssh] Connected to %s", addr)
 
+	log.Printf("[ssh] Initialising SFTP subsystem")
 	sftpClient, err := sftp.NewClient(client)
 	if err != nil {
 		client.Close()
 		return nil, fmt.Errorf("SFTP init failed: %v", err)
 	}
+	log.Printf("[ssh] SFTP ready")
 
 	return &SSHConnector{cfg: cfg, client: client, sftp: sftpClient}, nil
 }
@@ -75,6 +88,7 @@ func buildSSHAuth(cfg *config.SSHConfig) ([]gossh.AuthMethod, error) {
 }
 
 func (c *SSHConnector) runCommand(cmd string) (string, error) {
+	log.Printf("[ssh] Executing: %s", cmd)
 	session, err := c.client.NewSession()
 	if err != nil {
 		return "", fmt.Errorf("failed to create session: %v", err)
@@ -85,41 +99,50 @@ func (c *SSHConnector) runCommand(cmd string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("command %q failed: %v", cmd, err)
 	}
+	log.Printf("[ssh] Command output: %d bytes", len(out))
 	return string(out), nil
 }
 
 func (c *SSHConnector) ListDomains() ([]string, error) {
-	out, err := c.runCommand("virtualmin list-domains --name-only")
+	out, err := c.runCommand("virtualmin list-domains --json")
+	if err != nil {
+		return nil, err
+	}
+	all, err := parseVirtualminDomains([]byte(out))
 	if err != nil {
 		return nil, err
 	}
 	var domains []string
-	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	for _, d := range all {
+		if c.cfg.Domain != "" && d != c.cfg.Domain {
+			log.Printf("[ssh] Skipping domain %s (filter: %s)", d, c.cfg.Domain)
 			continue
 		}
-		if c.cfg.Domain != "" && line != c.cfg.Domain {
-			continue
-		}
-		domains = append(domains, line)
+		log.Printf("[ssh] Found domain: %s", d)
+		domains = append(domains, d)
 	}
+	log.Printf("[ssh] Total domains: %d", len(domains))
 	return domains, nil
 }
 
 func (c *SSHConnector) ListUsers(domain string) ([]MailUser, error) {
-	out, err := c.runCommand(fmt.Sprintf("virtualmin list-users --domain %s --multiline", domain))
+	out, err := c.runCommand(fmt.Sprintf("virtualmin list-users --domain %s --json", domain))
 	if err != nil {
 		return nil, err
 	}
-	maildirBase := c.cfg.MaildirBase
-	if maildirBase == "" {
-		maildirBase = "/home/%s/homes/%s/Maildir"
+	users, err := parseVirtualminUsersJSON(domain, []byte(out))
+	if err != nil {
+		return nil, err
 	}
-	return parseVirtualminUsers(domain, out, maildirBase), nil
+	for _, u := range users {
+		log.Printf("[ssh] Found user: %s  home: %s  maildir: %s", u.Username, u.HomeDir, u.MaildirPath)
+	}
+	log.Printf("[ssh] Total users in %s: %d", domain, len(users))
+	return users, nil
 }
 
 func (c *SSHConnector) Close() error {
+	log.Printf("[ssh] Closing connection")
 	if c.sftp != nil {
 		c.sftp.Close()
 	}
@@ -144,6 +167,7 @@ func NewSSHMaildirSource(sftpClient *sftp.Client, path string) *SSHMaildirSource
 }
 
 func (ms *SSHMaildirSource) ListFolders() ([]source.Folder, error) {
+	log.Printf("[sftp] Listing remote maildir: %s", ms.path)
 	entries, err := ms.sftp.ReadDir(ms.path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read remote maildir: %v", err)
@@ -157,61 +181,79 @@ func (ms *SSHMaildirSource) ListFolders() ([]source.Folder, error) {
 		name := entry.Name()
 		if folderName, ok := strings.CutPrefix(name, "."); ok {
 			folderName = strings.ReplaceAll(folderName, ".", "/")
+			log.Printf("[sftp] Found folder: %s", folderName)
 			folders = append(folders, source.Folder{Name: folderName})
 		}
 	}
+	log.Printf("[sftp] Total folders: %d", len(folders))
 	return folders, nil
 }
 
-func (ms *SSHMaildirSource) ListMessages(folder source.Folder) ([]source.Message, error) {
-	var dirPath string
-	if folder.Name == "INBOX" {
-		dirPath = ms.path
-	} else {
-		maildirName := "." + strings.ReplaceAll(folder.Name, "/", ".")
-		dirPath = ms.path + "/" + maildirName
-	}
-
-	var messages []source.Message
-	for _, subdir := range []string{"cur", "new"} {
-		subPath := dirPath + "/" + subdir
-		entries, err := ms.sftp.ReadDir(subPath)
-		if err != nil {
-			continue
+func (ms *SSHMaildirSource) Messages(folder source.Folder) iter.Seq2[source.Message, error] {
+	return func(yield func(source.Message, error) bool) {
+		var dirPath string
+		if folder.Name == "INBOX" {
+			dirPath = ms.path
+		} else {
+			maildirName := "." + strings.ReplaceAll(folder.Name, "/", ".")
+			dirPath = ms.path + "/" + maildirName
 		}
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
-			}
-			key := entry.Name()
-			filePath := subPath + "/" + key
 
-			f, err := ms.sftp.Open(filePath)
+		log.Printf("[sftp] Reading messages from %s (folder: %s)", dirPath, folder.Name)
+		count := 0
+
+		for _, subdir := range []string{"cur", "new"} {
+			subPath := dirPath + "/" + subdir
+			entries, err := ms.sftp.ReadDir(subPath)
 			if err != nil {
+				log.Printf("[sftp] Skipping %s: %v", subPath, err)
 				continue
 			}
-			content, err := io.ReadAll(f)
-			f.Close()
-			if err != nil {
-				continue
+			log.Printf("[sftp] %s: %d entries", subPath, len(entries))
+
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				key := entry.Name()
+				filePath := subPath + "/" + key
+
+				log.Printf("[sftp] Downloading %s (%d bytes)", filePath, entry.Size())
+				f, err := ms.sftp.Open(filePath)
+				if err != nil {
+					log.Printf("[sftp] Failed to open %s: %v", filePath, err)
+					yield(source.Message{}, fmt.Errorf("open %s: %w", filePath, err))
+					continue
+				}
+				content, err := io.ReadAll(f)
+				f.Close()
+				if err != nil {
+					log.Printf("[sftp] Failed to read %s: %v", filePath, err)
+					yield(source.Message{}, fmt.Errorf("read %s: %w", filePath, err))
+					continue
+				}
+
+				date := parseDateFromMaildirKey(key)
+				if date.IsZero() {
+					date = entry.ModTime()
+				}
+				flags := parseMaildirFlags(key)
+				log.Printf("[sftp] Message: key=%s  date=%s  flags=%v  size=%d",
+					key, date.Format("2006-01-02 15:04:05"), flags, len(content))
+
+				count++
+				if !yield(source.Message{
+					MessageID: fmt.Sprintf("<%s@maildir>", key),
+					Date:      date,
+					Flags:     flags,
+					Content:   content,
+				}, nil) {
+					return
+				}
 			}
-
-			date := parseDateFromMaildirKey(key)
-			if date.IsZero() {
-				date = entry.ModTime()
-			}
-
-			flags := parseMaildirFlags(key)
-
-			messages = append(messages, source.Message{
-				MessageID: fmt.Sprintf("<%s@maildir>", key),
-				Date:      date,
-				Flags:     flags,
-				Content:   content,
-			})
 		}
+		log.Printf("[sftp] Total messages streamed in %s: %d", folder.Name, count)
 	}
-	return messages, nil
 }
 
 func (ms *SSHMaildirSource) Close() error { return nil }

@@ -1,0 +1,15 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build",
+            "type": "shell",
+            "command": "go build -o ${workspaceFolder}/bin/WKMailSync ${workspaceFolder}/cmd/WKMailSync",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$go"
+        }
+    ]
+}

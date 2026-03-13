@@ -2,11 +2,10 @@ package connector
 
 import (
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
-	"strings"
 
 	"github.com/Warky-Devs/WkMailSync/pkg/config"
 )
@@ -35,23 +34,29 @@ func NewAPIConnector(cfg *config.VirtualminConfig) (*APIConnector, error) {
 
 	transport := &http.Transport{}
 	if apiCfg.InsecureTLS {
+		log.Printf("[api] TLS certificate verification disabled")
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
+
+	base := fmt.Sprintf("%s://%s:%s/virtual-server/remote.cgi", scheme, apiCfg.Host, port)
+	log.Printf("[api] Virtualmin API endpoint: %s", base)
+	log.Printf("[api] Authenticating as: %s", apiCfg.Username)
 
 	return &APIConnector{
 		cfg:    cfg,
 		client: &http.Client{Transport: transport},
-		base:   fmt.Sprintf("%s://%s:%s/virtual-server/remote.cgi", scheme, apiCfg.Host, port),
+		base:   base,
 	}, nil
 }
 
 func (c *APIConnector) apiGet(program string, params map[string]string) (string, error) {
 	apiCfg := c.cfg.API
-	url := fmt.Sprintf("%s?program=%s&multiline=", c.base, program)
+	url := fmt.Sprintf("%s?program=%s&json=1", c.base, program)
 	for k, v := range params {
 		url += fmt.Sprintf("&%s=%s", k, v)
 	}
 
+	log.Printf("[api] GET %s", url)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", err
@@ -64,60 +69,53 @@ func (c *APIConnector) apiGet(program string, params map[string]string) (string,
 	}
 	defer resp.Body.Close()
 
+	log.Printf("[api] Response: HTTP %d", resp.StatusCode)
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
+	log.Printf("[api] Response body: %d bytes", len(body))
 	return string(body), nil
 }
 
 func (c *APIConnector) ListDomains() ([]string, error) {
+	log.Printf("[api] Listing domains")
 	out, err := c.apiGet("list-domains", nil)
 	if err != nil {
 		return nil, err
 	}
-
-	var result []string
-	if err2 := json.Unmarshal([]byte(out), &result); err2 == nil {
-		if c.cfg.Domain != "" {
-			var filtered []string
-			for _, d := range result {
-				if d == c.cfg.Domain {
-					filtered = append(filtered, d)
-				}
-			}
-			return filtered, nil
-		}
-		return result, nil
+	all, err := parseVirtualminDomains([]byte(out))
+	if err != nil {
+		return nil, err
 	}
-
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+	var domains []string
+	for _, d := range all {
+		if c.cfg.Domain != "" && d != c.cfg.Domain {
+			log.Printf("[api] Skipping domain %s (filter: %s)", d, c.cfg.Domain)
 			continue
 		}
-		if strings.Contains(line, ":") {
-			if strings.HasPrefix(line, "name:") {
-				domain := strings.TrimSpace(strings.TrimPrefix(line, "name:"))
-				if c.cfg.Domain == "" || domain == c.cfg.Domain {
-					result = append(result, domain)
-				}
-			}
-		}
+		log.Printf("[api] Found domain: %s", d)
+		domains = append(domains, d)
 	}
-	return result, nil
+	log.Printf("[api] Total domains: %d", len(domains))
+	return domains, nil
 }
 
 func (c *APIConnector) ListUsers(domain string) ([]MailUser, error) {
+	log.Printf("[api] Listing users for domain: %s", domain)
 	out, err := c.apiGet("list-users", map[string]string{"domain": domain})
 	if err != nil {
 		return nil, err
 	}
-	maildirBase := c.cfg.MaildirBase
-	if maildirBase == "" {
-		maildirBase = "/home/%s/homes/%s/Maildir"
+	users, err := parseVirtualminUsersJSON(domain, []byte(out))
+	if err != nil {
+		return nil, err
 	}
-	return parseVirtualminUsers(domain, out, maildirBase), nil
+	for _, u := range users {
+		log.Printf("[api] Found user: %s  home: %s  maildir: %s", u.Username, u.HomeDir, u.MaildirPath)
+	}
+	log.Printf("[api] Total users in %s: %d", domain, len(users))
+	return users, nil
 }
 
 func (c *APIConnector) Close() error { return nil }

@@ -7,6 +7,22 @@ import (
 	"time"
 )
 
+// collectMessages drains the Messages iterator into a slice for test assertions.
+func collectMessages(src MailSource, folder Folder) ([]Message, error) {
+	var msgs []Message
+	var firstErr error
+	for msg, err := range src.Messages(folder) {
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		msgs = append(msgs, msg)
+	}
+	return msgs, firstErr
+}
+
 // buildMaildir creates a minimal Maildir structure for testing.
 // Returns the root path.
 func buildMaildir(t *testing.T) string {
@@ -108,7 +124,7 @@ func TestMaildirSource_ListMessages_Empty(t *testing.T) {
 	root := buildMaildir(t)
 	src, _ := NewMaildirSource(root)
 
-	msgs, err := src.ListMessages(Folder{Name: "INBOX"})
+	msgs, err := collectMessages(src, Folder{Name: "INBOX"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +140,7 @@ func TestMaildirSource_ListMessages_ReadsContent(t *testing.T) {
 	writeMaildirMsg(t, root, "cur", "1700000000.abc.host:2,S", content)
 
 	src, _ := NewMaildirSource(root)
-	msgs, err := src.ListMessages(Folder{Name: "INBOX"})
+	msgs, err := collectMessages(src, Folder{Name: "INBOX"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +158,7 @@ func TestMaildirSource_ListMessages_DateFromKey(t *testing.T) {
 	writeMaildirMsg(t, root, "cur", "1700000000.abc.host:2,", []byte("msg"))
 
 	src, _ := NewMaildirSource(root)
-	msgs, _ := src.ListMessages(Folder{Name: "INBOX"})
+	msgs, _ := collectMessages(src, Folder{Name: "INBOX"})
 	if len(msgs) == 0 {
 		t.Fatal("no messages")
 	}
@@ -156,7 +172,7 @@ func TestMaildirSource_ListMessages_FlagSeen(t *testing.T) {
 	writeMaildirMsg(t, root, "cur", "1700000001.x.h:2,S", []byte("seen msg"))
 
 	src, _ := NewMaildirSource(root)
-	msgs, _ := src.ListMessages(Folder{Name: "INBOX"})
+	msgs, _ := collectMessages(src, Folder{Name: "INBOX"})
 	if len(msgs) == 0 {
 		t.Fatal("no messages")
 	}
@@ -180,7 +196,7 @@ func TestMaildirSource_ListMessages_Subfolder(t *testing.T) {
 	writeMaildirMsg(t, root, ".Sent/cur", "1700000002.y.h:2,", content)
 
 	src, _ := NewMaildirSource(root)
-	msgs, err := src.ListMessages(Folder{Name: "Sent"})
+	msgs, err := collectMessages(src, Folder{Name: "Sent"})
 	if err != nil {
 		t.Fatal(err)
 	}

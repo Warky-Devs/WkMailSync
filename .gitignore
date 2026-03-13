@@ -33,3 +33,4 @@ go.work.sum
 __debug_bin*
 temp/
 WKMailSync
+bin/

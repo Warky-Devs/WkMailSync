@@ -13,12 +13,14 @@ import (
 )
 
 type SyncEngine struct {
-	Source   source.MailSource
-	Output   output.MailOutput
-	DateFrom time.Time
-	DateTo   time.Time
-	DryRun   bool
-	Stats    *config.SyncStats
+	Source        source.MailSource
+	Output        output.MailOutput
+	DateFrom      time.Time
+	DateTo        time.Time
+	DryRun        bool
+	Stats         *config.SyncStats
+	FolderInclude []string // only sync these folders; empty = all
+	FolderExclude []string // skip these folders
 }
 
 func NewSyncEngine(src source.MailSource, out output.MailOutput) *SyncEngine {
@@ -39,6 +41,10 @@ func (e *SyncEngine) Run() error {
 	log.Printf("Found %d folders to sync", len(folders))
 
 	for i, folder := range folders {
+		if skip, reason := e.skipFolder(folder.Name); skip {
+			log.Printf("[%d/%d] Skipping folder %s (%s)", i+1, len(folders), folder.Name, reason)
+			continue
+		}
 		log.Printf("[%d/%d] Processing folder: %s", i+1, len(folders), folder.Name)
 		if err := e.syncFolder(folder); err != nil {
 			log.Printf("Failed to sync folder %s: %v", folder.Name, err)
@@ -50,18 +56,18 @@ func (e *SyncEngine) Run() error {
 }
 
 func (e *SyncEngine) syncFolder(folder source.Folder) error {
-	messages, err := e.Source.ListMessages(folder)
-	if err != nil {
-		return fmt.Errorf("failed to list messages: %v", err)
-	}
-
-	e.Stats.TotalMessages += len(messages)
-	log.Printf("  Found %d messages", len(messages))
-
 	copied := 0
 	skipped := 0
 
-	for _, msg := range messages {
+	for msg, err := range e.Source.Messages(folder) {
+		if err != nil {
+			log.Printf("  Error reading message: %v", err)
+			e.Stats.Errors++
+			continue
+		}
+
+		e.Stats.TotalMessages++
+
 		if !e.shouldProcess(msg) {
 			skipped++
 			e.Stats.SkippedMessages++
@@ -95,6 +101,23 @@ func (e *SyncEngine) syncFolder(folder source.Folder) error {
 
 	log.Printf("  Copied: %d, Skipped: %d", copied, skipped)
 	return nil
+}
+
+func (e *SyncEngine) skipFolder(name string) (bool, string) {
+	if len(e.FolderInclude) > 0 {
+		for _, f := range e.FolderInclude {
+			if strings.EqualFold(f, name) {
+				return false, ""
+			}
+		}
+		return true, "not in folder_include"
+	}
+	for _, f := range e.FolderExclude {
+		if strings.EqualFold(f, name) {
+			return true, "in folder_exclude"
+		}
+	}
+	return false, ""
 }
 
 func (e *SyncEngine) shouldProcess(msg source.Message) bool {

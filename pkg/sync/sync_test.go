@@ -2,6 +2,7 @@ package sync
 
 import (
 	"errors"
+	"iter"
 	"testing"
 	"time"
 
@@ -21,8 +22,18 @@ func (f *fakeSource) ListFolders() ([]source.Folder, error) {
 	return f.folders, f.listErr
 }
 
-func (f *fakeSource) ListMessages(folder source.Folder) ([]source.Message, error) {
-	return f.messages[folder.Name], f.msgErr
+func (f *fakeSource) Messages(folder source.Folder) iter.Seq2[source.Message, error] {
+	return func(yield func(source.Message, error) bool) {
+		if f.msgErr != nil {
+			yield(source.Message{}, f.msgErr)
+			return
+		}
+		for _, msg := range f.messages[folder.Name] {
+			if !yield(msg, nil) {
+				return
+			}
+		}
+	}
 }
 
 func (f *fakeSource) Close() error { return nil }
@@ -274,6 +285,78 @@ func TestSyncEngine_ListFoldersError(t *testing.T) {
 	err := engine.Run()
 	if err == nil {
 		t.Error("expected error from ListFolders failure")
+	}
+}
+
+func TestSyncEngine_FolderExclude(t *testing.T) {
+	src := &fakeSource{
+		folders: []source.Folder{{Name: "INBOX"}, {Name: "Trash"}, {Name: "Spam"}},
+		messages: map[string][]source.Message{
+			"INBOX": {msgAt(time.Now())},
+			"Trash": {msgAt(time.Now())},
+			"Spam":  {msgAt(time.Now())},
+		},
+	}
+	out := newFakeOutput()
+
+	engine := NewSyncEngine(src, out)
+	engine.FolderExclude = []string{"Trash", "Spam"}
+	engine.Run()
+
+	if engine.Stats.CopiedMessages != 1 {
+		t.Errorf("CopiedMessages = %d, want 1 (only INBOX)", engine.Stats.CopiedMessages)
+	}
+}
+
+func TestSyncEngine_FolderInclude(t *testing.T) {
+	src := &fakeSource{
+		folders: []source.Folder{{Name: "INBOX"}, {Name: "Sent"}, {Name: "Trash"}},
+		messages: map[string][]source.Message{
+			"INBOX": {msgAt(time.Now()), msgAt(time.Now())},
+			"Sent":  {msgAt(time.Now())},
+			"Trash": {msgAt(time.Now())},
+		},
+	}
+	out := newFakeOutput()
+
+	engine := NewSyncEngine(src, out)
+	engine.FolderInclude = []string{"INBOX", "Sent"}
+	engine.Run()
+
+	if engine.Stats.CopiedMessages != 3 {
+		t.Errorf("CopiedMessages = %d, want 3 (INBOX+Sent only)", engine.Stats.CopiedMessages)
+	}
+}
+
+func TestSyncEngine_FolderIncludeCaseInsensitive(t *testing.T) {
+	src := &fakeSource{
+		folders:  []source.Folder{{Name: "INBOX"}, {Name: "Sent"}},
+		messages: map[string][]source.Message{"INBOX": {msgAt(time.Now())}, "Sent": {msgAt(time.Now())}},
+	}
+	out := newFakeOutput()
+
+	engine := NewSyncEngine(src, out)
+	engine.FolderInclude = []string{"inbox"} // lowercase
+	engine.Run()
+
+	if engine.Stats.CopiedMessages != 1 {
+		t.Errorf("CopiedMessages = %d, want 1", engine.Stats.CopiedMessages)
+	}
+}
+
+func TestSyncEngine_FolderExcludeCaseInsensitive(t *testing.T) {
+	src := &fakeSource{
+		folders:  []source.Folder{{Name: "INBOX"}, {Name: "Trash"}},
+		messages: map[string][]source.Message{"INBOX": {msgAt(time.Now())}, "Trash": {msgAt(time.Now())}},
+	}
+	out := newFakeOutput()
+
+	engine := NewSyncEngine(src, out)
+	engine.FolderExclude = []string{"trash"} // lowercase
+	engine.Run()
+
+	if engine.Stats.CopiedMessages != 1 {
+		t.Errorf("CopiedMessages = %d, want 1 (Trash excluded)", engine.Stats.CopiedMessages)
 	}
 }
 

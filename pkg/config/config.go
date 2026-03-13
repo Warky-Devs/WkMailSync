@@ -28,6 +28,8 @@ type Config struct {
 	OutputFormat  string            `yaml:"output_format"`
 	MaildirSource *MaildirConfig    `yaml:"maildir_source"`
 	Virtualmin    *VirtualminConfig `yaml:"virtualmin"`
+	FolderInclude []string          `yaml:"folder_include"` // only sync these folders; empty = all
+	FolderExclude []string          `yaml:"folder_exclude"` // skip these folders
 }
 
 type MaildirConfig struct {
@@ -40,6 +42,7 @@ type VirtualminConfig struct {
 	Mode        string               `yaml:"mode"`
 	Domain      string               `yaml:"domain"`
 	MaildirBase string               `yaml:"maildir_base"`
+	Workers     int                  `yaml:"workers"` // parallel domain workers; default 4
 	SSH         *SSHConfig           `yaml:"ssh"`
 	API         *VirtualminAPIConfig `yaml:"api"`
 }

@@ -1,9 +1,10 @@
 package connector
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"os/exec"
-	"strings"
 
 	"github.com/Warky-Devs/WkMailSync/pkg/config"
 )
@@ -17,31 +18,43 @@ func NewLocalConnector(cfg *config.VirtualminConfig) *LocalConnector {
 }
 
 func (c *LocalConnector) ListDomains() ([]string, error) {
-	out, err := exec.Command("virtualmin", "list-domains", "--name-only").Output()
+	log.Printf("[local] Running: virtualmin list-domains --json")
+	out, err := exec.Command("virtualmin", "list-domains", "--json").Output()
 	if err != nil {
 		return nil, fmt.Errorf("virtualmin list-domains failed: %v", err)
 	}
-	var domains []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if c.cfg.Domain != "" && line != c.cfg.Domain {
-			continue
-		}
-		domains = append(domains, line)
+	all, err := parseVirtualminDomains(out)
+	if err != nil {
+		return nil, err
 	}
+	var domains []string
+	for _, d := range all {
+		if c.cfg.Domain != "" && d != c.cfg.Domain {
+			log.Printf("[local] Skipping domain %s (filter: %s)", d, c.cfg.Domain)
+			continue
+		}
+		log.Printf("[local] Found domain: %s", d)
+		domains = append(domains, d)
+	}
+	log.Printf("[local] Total domains: %d", len(domains))
 	return domains, nil
 }
 
 func (c *LocalConnector) ListUsers(domain string) ([]MailUser, error) {
-	out, err := exec.Command("virtualmin", "list-users", "--domain", domain, "--multiline").Output()
+	log.Printf("[local] Running: virtualmin list-users --domain %s --json", domain)
+	out, err := exec.Command("virtualmin", "list-users", "--domain", domain, "--json").Output()
 	if err != nil {
 		return nil, fmt.Errorf("virtualmin list-users failed: %v", err)
 	}
-
-	return parseVirtualminUsers(domain, string(out), c.maildirBase()), nil
+	users, err := parseVirtualminUsersJSON(domain, out)
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range users {
+		log.Printf("[local] Found user: %s  home: %s  maildir: %s", u.Username, u.HomeDir, u.MaildirPath)
+	}
+	log.Printf("[local] Total users in %s: %d", domain, len(users))
+	return users, nil
 }
 
 func (c *LocalConnector) maildirBase() string {
@@ -53,32 +66,61 @@ func (c *LocalConnector) maildirBase() string {
 
 func (c *LocalConnector) Close() error { return nil }
 
-func parseVirtualminUsers(domain, output, maildirBase string) []MailUser {
-	var users []MailUser
-	var current *MailUser
+// virtualminResponse is the top-level JSON structure returned by virtualmin --json commands.
+type virtualminResponse struct {
+	Status string `json:"status"`
+	Data   []struct {
+		Name   string                       `json:"name"`
+		Values map[string][]string          `json:"values"`
+	} `json:"data"`
+}
 
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "username:") {
-			if current != nil {
-				users = append(users, *current)
-			}
-			username := strings.TrimSpace(strings.TrimPrefix(line, "username:"))
-			maildirPath := fmt.Sprintf(maildirBase, domain, username)
-			current = &MailUser{
-				Domain:      domain,
-				Username:    username,
-				MaildirPath: maildirPath,
-			}
-		} else if current != nil && strings.HasPrefix(line, "home:") {
-			current.HomeDir = strings.TrimSpace(strings.TrimPrefix(line, "home:"))
-			if maildirBase == "/home/%s/homes/%s/Maildir" {
-				current.MaildirPath = current.HomeDir + "/Maildir"
-			}
+func parseVirtualminDomains(raw []byte) ([]string, error) {
+	var resp virtualminResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse virtualmin JSON: %v", err)
+	}
+	var domains []string
+	for _, entry := range resp.Data {
+		if entry.Name != "" {
+			domains = append(domains, entry.Name)
 		}
 	}
-	if current != nil {
-		users = append(users, *current)
+	return domains, nil
+}
+
+func parseVirtualminUsersJSON(domain string, raw []byte) ([]MailUser, error) {
+	var resp virtualminResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse virtualmin JSON: %v", err)
 	}
-	return users
+
+	var users []MailUser
+	for _, entry := range resp.Data {
+		v := entry.Values
+		username := first(v["user"])
+		maildir := first(v["mail_location"])
+		home := first(v["home_directory"])
+
+		if username == "" || maildir == "" {
+			log.Printf("[virtualmin] Skipping incomplete user entry: %s", entry.Name)
+			continue
+		}
+
+		users = append(users, MailUser{
+			Domain:      domain,
+			Username:    username,
+			HomeDir:     home,
+			MaildirPath: maildir,
+		})
+	}
+	return users, nil
+}
+
+// first returns the first element of a slice, or "" if empty.
+func first(s []string) string {
+	if len(s) > 0 {
+		return s[0]
+	}
+	return ""
 }

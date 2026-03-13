@@ -1,6 +1,9 @@
 package source
 
-import "time"
+import (
+	"iter"
+	"time"
+)
 
 type Message struct {
 	MessageID string
@@ -17,6 +20,9 @@ type Folder struct {
 
 type MailSource interface {
 	ListFolders() ([]Folder, error)
-	ListMessages(folder Folder) ([]Message, error)
+	// Messages streams messages in the folder one at a time.
+	// The caller ranges over the iterator; each yield is (Message, error).
+	// A non-nil error signals a fatal read failure for that item.
+	Messages(folder Folder) iter.Seq2[Message, error]
 	Close() error
 }

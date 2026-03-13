@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/Warky-Devs/WkMailSync/pkg/config"
@@ -95,11 +96,21 @@ func main() {
 	}
 
 	if cfg.Virtualmin != nil {
+		log.Printf("Mode: Virtualmin (%s)", cfg.Virtualmin.Mode)
+		log.Printf("Output: %s -> %s", cfg.OutputFormat, cfg.OutputDir)
+		if !dateFromParsed.IsZero() {
+			log.Printf("Date filter from: %s", dateFromParsed.Format("2006-01-02"))
+		}
+		if !dateToParsed.IsZero() {
+			log.Printf("Date filter to:   %s", dateToParsed.Format("2006-01-02"))
+		}
 		runVirtualmin(cfg, dateFromParsed, dateToParsed)
 		return
 	}
 
 	if cfg.MaildirSource != nil {
+		log.Printf("Mode: Maildir source -> %s (%s)", cfg.OutputDir, cfg.OutputFormat)
+		log.Printf("Maildir path: %s", cfg.MaildirSource.Path)
 		runMaildirSync(cfg, dateFromParsed, dateToParsed)
 		return
 	}
@@ -124,6 +135,8 @@ func runIMAPSync(cfg *config.Config, dateFrom, dateTo time.Time) {
 	engine.DateFrom = dateFrom
 	engine.DateTo = dateTo
 	engine.DryRun = cfg.DryRun
+	engine.FolderInclude = cfg.FolderInclude
+	engine.FolderExclude = cfg.FolderExclude
 
 	if err := engine.Run(); err != nil {
 		log.Fatalf("Sync failed: %v", err)
@@ -149,6 +162,8 @@ func runMaildirSync(cfg *config.Config, dateFrom, dateTo time.Time) {
 	engine.DateFrom = dateFrom
 	engine.DateTo = dateTo
 	engine.DryRun = cfg.DryRun
+	engine.FolderInclude = cfg.FolderInclude
+	engine.FolderExclude = cfg.FolderExclude
 
 	if err := engine.Run(); err != nil {
 		log.Fatalf("Sync failed: %v", err)
@@ -156,84 +171,116 @@ func runMaildirSync(cfg *config.Config, dateFrom, dateTo time.Time) {
 	engine.PrintStats()
 }
 
+type userJob struct {
+	user    connector.MailUser
+	sshConn *connector.SSHConnector // non-nil only for ssh mode
+}
+
 func runVirtualmin(cfg *config.Config, dateFrom, dateTo time.Time) {
 	vm := cfg.Virtualmin
-	var conn connector.VirtualminConnector
-	var err error
+
+	workers := vm.Workers
+	if workers <= 0 {
+		workers = 4
+	}
+
+	// --- build connector and collect all users across all domains ---
+	var jobs []userJob
 
 	switch vm.Mode {
 	case "local":
-		conn = connector.NewLocalConnector(vm)
+		log.Printf("[virtualmin] Mode: local (using virtualmin CLI)")
+		conn := connector.NewLocalConnector(vm)
+		defer conn.Close()
+		jobs = collectJobs(conn, vm, nil)
+
 	case "ssh":
-		sshConn, sshErr := connector.NewSSHConnector(vm)
-		if sshErr != nil {
-			log.Fatalf("SSH connector failed: %v", sshErr)
+		log.Printf("[virtualmin] Mode: SSH (%s)", vm.SSH.Host)
+		sshConn, err := connector.NewSSHConnector(vm)
+		if err != nil {
+			log.Fatalf("SSH connector failed: %v", err)
 		}
 		defer sshConn.Close()
-
-		domains, err := sshConn.ListDomains()
-		if err != nil {
-			log.Fatalf("Failed to list domains: %v", err)
-		}
-		for _, domain := range domains {
-			users, err := sshConn.ListUsers(domain)
-			if err != nil {
-				log.Printf("Failed to list users for %s: %v", domain, err)
-				continue
-			}
-			for _, user := range users {
-				src := sshConn.NewMaildirSource(user.MaildirPath)
-				username := user.Username + "@" + user.Domain
-				out, err := buildOutput(cfg, username)
-				if err != nil {
-					log.Printf("Failed to create output for %s: %v", username, err)
-					continue
-				}
-				runEngineForUser(src, out, cfg, dateFrom, dateTo, username)
-			}
-		}
-		return
+		jobs = collectJobs(sshConn, vm, sshConn)
 
 	case "api":
-		conn, err = connector.NewAPIConnector(vm)
+		log.Printf("[virtualmin] Mode: API (%s:%s)", vm.API.Host, vm.API.Port)
+		conn, err := connector.NewAPIConnector(vm)
 		if err != nil {
 			log.Fatalf("API connector failed: %v", err)
 		}
+		defer conn.Close()
+		jobs = collectJobs(conn, vm, nil)
+
 	default:
 		log.Fatalf("Unknown virtualmin mode: %s (use local, ssh, or api)", vm.Mode)
 	}
 
-	if conn != nil {
-		defer conn.Close()
+	log.Printf("[virtualmin] %d user(s) queued across all domains, running %d worker(s)", len(jobs), workers)
+
+	// --- worker pool ---
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+
+	for i, job := range jobs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, j userJob) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			username := j.user.Username + "@" + j.user.Domain
+			log.Printf("[virtualmin] [%d/%d] Starting: %s", idx+1, len(jobs), username)
+
+			var src source.MailSource
+			if j.sshConn != nil {
+				src = j.sshConn.NewMaildirSource(j.user.MaildirPath)
+			} else {
+				var err error
+				src, err = source.NewMaildirSource(j.user.MaildirPath)
+				if err != nil {
+					log.Printf("[virtualmin] Failed to open maildir for %s: %v", username, err)
+					return
+				}
+			}
+
+			out, err := buildOutput(cfg, username)
+			if err != nil {
+				log.Printf("[virtualmin] Failed to create output for %s: %v", username, err)
+				src.Close()
+				return
+			}
+
+			runEngineForUser(src, out, cfg, dateFrom, dateTo, username)
+			log.Printf("[virtualmin] [%d/%d] Done: %s", idx+1, len(jobs), username)
+		}(i, job)
 	}
 
+	wg.Wait()
+	log.Printf("[virtualmin] All users complete")
+}
+
+// collectJobs enumerates all domains → users and returns a flat job list.
+func collectJobs(conn connector.VirtualminConnector, vm *config.VirtualminConfig, sshConn *connector.SSHConnector) []userJob {
 	domains, err := conn.ListDomains()
 	if err != nil {
-		log.Fatalf("Failed to list domains: %v", err)
+		log.Fatalf("[virtualmin] Failed to list domains: %v", err)
 	}
+	log.Printf("[virtualmin] Found %d domain(s)", len(domains))
 
-	for _, domain := range domains {
+	var jobs []userJob
+	for di, domain := range domains {
+		log.Printf("[virtualmin] [%d/%d] Enumerating users in: %s", di+1, len(domains), domain)
 		users, err := conn.ListUsers(domain)
 		if err != nil {
-			log.Printf("Failed to list users for %s: %v", domain, err)
+			log.Printf("[virtualmin] Failed to list users for %s: %v", domain, err)
 			continue
 		}
 		for _, user := range users {
-			src, err := source.NewMaildirSource(user.MaildirPath)
-			if err != nil {
-				log.Printf("Failed to open maildir for %s@%s: %v", user.Username, user.Domain, err)
-				continue
-			}
-			username := user.Username + "@" + user.Domain
-			out, err := buildOutput(cfg, username)
-			if err != nil {
-				log.Printf("Failed to create output for %s: %v", username, err)
-				src.Close()
-				continue
-			}
-			runEngineForUser(src, out, cfg, dateFrom, dateTo, username)
+			jobs = append(jobs, userJob{user: user, sshConn: sshConn})
 		}
 	}
+	return jobs
 }
 
 func runEngineForUser(src source.MailSource, out output.MailOutput, cfg *config.Config, dateFrom, dateTo time.Time, username string) {
@@ -244,6 +291,8 @@ func runEngineForUser(src source.MailSource, out output.MailOutput, cfg *config.
 	engine.DateFrom = dateFrom
 	engine.DateTo = dateTo
 	engine.DryRun = cfg.DryRun
+	engine.FolderInclude = cfg.FolderInclude
+	engine.FolderExclude = cfg.FolderExclude
 
 	log.Printf("Syncing user: %s", username)
 	if err := engine.Run(); err != nil {

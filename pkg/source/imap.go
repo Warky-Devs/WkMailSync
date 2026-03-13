@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"iter"
 	"log"
 	"strings"
 	"time"
@@ -123,61 +124,84 @@ func (s *IMAPSource) ListFolders() ([]Folder, error) {
 	return folders, nil
 }
 
-func (s *IMAPSource) ListMessages(folder Folder) ([]Message, error) {
-	mbox, err := s.client.Select(folder.Name, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to select mailbox %s: %v", folder.Name, err)
-	}
-
-	if mbox.Messages == 0 {
-		return nil, nil
-	}
-
-	const batchSize = 100
-	var result []Message
-
-	for start := uint32(1); start <= mbox.Messages; start += batchSize {
-		end := start + batchSize - 1
-		if end > mbox.Messages {
-			end = mbox.Messages
+func (s *IMAPSource) Messages(folder Folder) iter.Seq2[Message, error] {
+	return func(yield func(Message, error) bool) {
+		mbox, err := s.client.Select(folder.Name, true)
+		if err != nil {
+			yield(Message{}, fmt.Errorf("failed to select mailbox %s: %v", folder.Name, err))
+			return
+		}
+		if mbox.Messages == 0 {
+			return
 		}
 
-		seqset := new(imap.SeqSet)
-		seqset.AddRange(start, end)
-
-		messages := make(chan *imap.Message, int(end-start+1)+10)
-		done := make(chan error, 1)
-		go func() {
-			done <- s.client.Fetch(seqset, []imap.FetchItem{
-				imap.FetchEnvelope,
-				imap.FetchRFC822,
-				imap.FetchFlags,
-				imap.FetchInternalDate,
-			}, messages)
-		}()
-
-		var batch []*imap.Message
-		for msg := range messages {
-			batch = append(batch, msg)
-		}
-
-		if err := <-done; err != nil {
-			return nil, fmt.Errorf("failed to fetch messages: %v", err)
-		}
-
-		for _, msg := range batch {
-			if msg.Envelope == nil {
-				continue
+		const batchSize = 100
+		for start := uint32(1); start <= mbox.Messages; start += batchSize {
+			end := start + batchSize - 1
+			if end > mbox.Messages {
+				end = mbox.Messages
 			}
 
-			content, err := extractRawContent(msg)
-			if err != nil {
-				log.Printf("  Failed to extract content for message %v: %v", msg.SeqNum, err)
-				continue
+			seqset := new(imap.SeqSet)
+			seqset.AddRange(start, end)
+
+			ch := make(chan *imap.Message, int(end-start+1)+10)
+			done := make(chan error, 1)
+			go func() {
+				done <- s.client.Fetch(seqset, []imap.FetchItem{
+					imap.FetchEnvelope,
+					imap.FetchRFC822,
+					imap.FetchFlags,
+					imap.FetchInternalDate,
+				}, ch)
+			}()
+
+			// Drain the channel first to avoid deadlocking the IMAP fetch goroutine
+			var batch []*imap.Message
+			for msg := range ch {
+				batch = append(batch, msg)
+			}
+			if err := <-done; err != nil {
+				yield(Message{}, fmt.Errorf("failed to fetch messages: %v", err))
+				return
 			}
 
-			messageID := msg.Envelope.MessageId
-			if messageID == "" {
+			for _, msg := range batch {
+				if msg.Envelope == nil {
+					continue
+				}
+				content, err := extractRawContent(msg)
+				if err != nil {
+					log.Printf("  Failed to extract content for message %v: %v", msg.SeqNum, err)
+					continue
+				}
+
+				messageID := msg.Envelope.MessageId
+				if messageID == "" {
+					date := msg.InternalDate
+					if date.IsZero() && !msg.Envelope.Date.IsZero() {
+						date = msg.Envelope.Date
+					}
+					if date.IsZero() {
+						date = time.Now()
+					}
+					subject := msg.Envelope.Subject
+					if subject == "" {
+						subject = "(no subject)"
+					}
+					h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d-%d", subject, date.Unix(), msg.SeqNum)))
+					messageID = fmt.Sprintf("<%x@wkmailsync.generated>", h[:8])
+				}
+
+				from := ""
+				if len(msg.Envelope.From) > 0 {
+					if msg.Envelope.From[0].PersonalName != "" {
+						from = msg.Envelope.From[0].PersonalName
+					} else if msg.Envelope.From[0].MailboxName != "" {
+						from = msg.Envelope.From[0].MailboxName
+					}
+				}
+
 				date := msg.InternalDate
 				if date.IsZero() && !msg.Envelope.Date.IsZero() {
 					date = msg.Envelope.Date
@@ -185,43 +209,20 @@ func (s *IMAPSource) ListMessages(folder Folder) ([]Message, error) {
 				if date.IsZero() {
 					date = time.Now()
 				}
-				subject := msg.Envelope.Subject
-				if subject == "" {
-					subject = "(no subject)"
-				}
-				h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d-%d", subject, date.Unix(), msg.SeqNum)))
-				messageID = fmt.Sprintf("<%x@wkmailsync.generated>", h[:8])
-			}
 
-			from := ""
-			if len(msg.Envelope.From) > 0 {
-				if msg.Envelope.From[0].PersonalName != "" {
-					from = msg.Envelope.From[0].PersonalName
-				} else if msg.Envelope.From[0].MailboxName != "" {
-					from = msg.Envelope.From[0].MailboxName
+				if !yield(Message{
+					MessageID: messageID,
+					Subject:   msg.Envelope.Subject,
+					From:      from,
+					Date:      date,
+					Flags:     msg.Flags,
+					Content:   content,
+				}, nil) {
+					return
 				}
 			}
-
-			date := msg.InternalDate
-			if date.IsZero() && !msg.Envelope.Date.IsZero() {
-				date = msg.Envelope.Date
-			}
-			if date.IsZero() {
-				date = time.Now()
-			}
-
-			result = append(result, Message{
-				MessageID: messageID,
-				Subject:   msg.Envelope.Subject,
-				From:      from,
-				Date:      date,
-				Flags:     msg.Flags,
-				Content:   content,
-			})
 		}
 	}
-
-	return result, nil
 }
 
 func (s *IMAPSource) Close() error {

@@ -3,6 +3,7 @@ package source
 import (
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,34 +50,37 @@ func (s *MaildirSource) ListFolders() ([]Folder, error) {
 	return folders, nil
 }
 
-func (s *MaildirSource) ListMessages(folder Folder) ([]Message, error) {
-	var dirPath string
-	if folder.Name == "INBOX" {
-		dirPath = s.path
-	} else {
-		maildirName := "." + strings.ReplaceAll(folder.Name, "/", ".")
-		dirPath = filepath.Join(s.path, maildirName)
-	}
-
-	dir := maildir.Dir(dirPath)
-	msgs, err := dir.Messages()
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
+func (s *MaildirSource) Messages(folder Folder) iter.Seq2[Message, error] {
+	return func(yield func(Message, error) bool) {
+		var dirPath string
+		if folder.Name == "INBOX" {
+			dirPath = s.path
+		} else {
+			maildirName := "." + strings.ReplaceAll(folder.Name, "/", ".")
+			dirPath = filepath.Join(s.path, maildirName)
 		}
-		return nil, fmt.Errorf("failed to list maildir messages: %v", err)
-	}
 
-	var messages []Message
-	for _, msg := range msgs {
-		m, err := s.readMaildirMessage(msg)
+		dir := maildir.Dir(dirPath)
+		msgs, err := dir.Messages()
 		if err != nil {
-			continue
+			if os.IsNotExist(err) {
+				return
+			}
+			yield(Message{}, fmt.Errorf("failed to list maildir messages: %v", err))
+			return
 		}
-		messages = append(messages, m)
-	}
 
-	return messages, nil
+		for _, msg := range msgs {
+			m, err := s.readMaildirMessage(msg)
+			if err != nil {
+				yield(Message{}, err)
+				continue
+			}
+			if !yield(m, nil) {
+				return
+			}
+		}
+	}
 }
 
 func (s *MaildirSource) readMaildirMessage(msg *maildir.Message) (Message, error) {
