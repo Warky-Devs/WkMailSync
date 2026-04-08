@@ -7,7 +7,7 @@ Standards-Version: 4.6.2
 Homepage: https://github.com/Warky-Devs/WkMailSync
 
 Package: wkmailsync
-Version: 1.0.6
+Version: 1.0.7
 Architecture: amd64
 Depends: ${misc:Depends}
 Description: Mail synchronization and backup tool
