@@ -86,6 +86,7 @@ jobs:
           gh release create "${TAG}" \
             --title "${TAG}" \
             --notes "${BODY}" \
+            --draft \
             dist/*.tar.gz dist/*.zip dist/checksums.txt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -292,5 +293,16 @@ jobs:
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           gh release upload "${TAG}" $(find installers/rpm/out -name "*.rpm")
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    needs: [pkg-aur, pkg-deb, pkg-rpm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release edit "${TAG}" --draft=false --repo "${GITHUB_REPOSITORY}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
