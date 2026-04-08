@@ -35,3 +35,4 @@ temp/
 WKMailSync
 bin/
 tmp/
+installers/arch/WkMailSync-*.tar.gz
