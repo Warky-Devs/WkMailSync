@@ -1,151 +1,334 @@
-name: Build and Release
+name: Release
 
 on:
   push:
     tags:
-      - 'v*' # Triggers on version tags like v1.0.0, v2.1.0, etc.
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.2.3)'
+        required: true
 
 permissions:
-  contents: write # Required for creating releases
-  id-token: write # Required for GitHub Actions to access the repository
-  packages: write # Required for uploading release assets
-  issues: write # Optional, if you want to create issues for failed builds
-  pull-requests: write # Optional, if you want to create PRs for failed builds
-  checks: write # Required for updating checks on the commit
-  statuses: write # Required for updating commit statuses
-  
-jobs:
-  build-and-release:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0 # Fetch all history for proper version info
-    
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.22'
-        check-latest: true
-    
-    - name: Get dependencies
-      run: go mod download
-    
-    - name: Run tests
-      run: go test -v ./...
-    
-    - name: Extract tag name
-      id: tag
-      run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-    
-    - name: Build binaries
-      run: |
-        # Create dist directory
-        mkdir -p dist
-        
-        # Define build targets (OS/ARCH combinations)
-        targets=(
-          "linux/amd64"
-          "linux/arm64"
-          "windows/amd64"
-          "windows/arm64"
-        )
-        
-        # Set the application name
-        APP_NAME="wkmailsync"
-        
-        for target in "${targets[@]}"; do
-          OS=$(echo $target | cut -d'/' -f1)
-          ARCH=$(echo $target | cut -d'/' -f2)
-          
-          # Set binary name with OS-specific extension
-          BINARY_NAME="${APP_NAME}-${OS}-${ARCH}"
-          if [ "$OS" = "windows" ]; then
-            BINARY_NAME="${BINARY_NAME}.exe"
-          fi
-          
-          echo "Building for $OS/$ARCH..."
+  contents: write
+  packages: write
 
-          # Build the binary
-          CGO_ENABLED=0 GOOS=$OS GOARCH=$ARCH go build \
-            -ldflags="-s -w -X 'main.version=${{ steps.tag.outputs.tag }}' " \
-            -o "dist/${BINARY_NAME}" \
-            ./cmd/wkmailsync
-          
-          # Create compressed archive
-          if [ "$OS" = "windows" ]; then
-            zip -j "dist/${APP_NAME}-${OS}-${ARCH}.zip" "dist/${BINARY_NAME}"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+      - name: Lint
+        run: go vet ./...
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build release binaries
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          mkdir -p dist
+          for target in "linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64" "windows/amd64"; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            EXT=""
+            [ "$GOOS" = "windows" ] && EXT=".exe"
+            BINARY="wkmailsync-${GOOS}-${GOARCH}${EXT}"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/${BINARY}" \
+              ./cmd/wkmailsync
+            if [ "$GOOS" = "windows" ]; then
+              zip -j "dist/wkmailsync-${GOOS}-${GOARCH}.zip" "dist/${BINARY}"
+            else
+              tar -czf "dist/wkmailsync-${GOOS}-${GOARCH}.tar.gz" -C dist "${BINARY}"
+            fi
+            echo "Built ${BINARY}"
+          done
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip > checksums.txt
+
+      - name: Create release and upload assets
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          API="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases"
+
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -1)
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..${TAG}"
           else
-            tar -czf "dist/${APP_NAME}-${OS}-${ARCH}.tar.gz" -C dist "${BINARY_NAME}"
+            RANGE="HEAD~20..HEAD"
           fi
-        done
-    
-    - name: Generate changelog
-      id: changelog
-      run: |
-        # Get the previous tag
-        PREV_TAG=$(git tag --sort=-version:refname | sed -n '2p')
-        
-        if [ -z "$PREV_TAG" ]; then
-          echo "changelog=Initial release" >> $GITHUB_OUTPUT
-        else
-          # Generate changelog from commits between tags
-          CHANGELOG=$(git log --pretty=format:"- %s (%h)" $PREV_TAG..${{ steps.tag.outputs.tag }})
-          # Escape newlines for GitHub output
-          CHANGELOG="${CHANGELOG//'%'/'%25'}"
-          CHANGELOG="${CHANGELOG//$'\n'/'%0A'}"
-          CHANGELOG="${CHANGELOG//$'\r'/'%0D'}"
-          echo "changelog=$CHANGELOG" >> $GITHUB_OUTPUT
-        fi
-    
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.tag }}
-        release_name: Release ${{ steps.tag.outputs.tag }}
-        body: |
-          ## Changes
-          ${{ steps.changelog.outputs.changelog }}
-          
-          ## Downloads
-          Download the appropriate binary for your platform below.
-          
-          ### Checksums
-          See the checksums file for SHA256 hashes of all binaries.
-        draft: false
-        prerelease: ${{ contains(steps.tag.outputs.tag, '-') }} # Mark as prerelease if tag contains hyphen (e.g., v1.0.0-beta)
-    
-    - name: Generate checksums
-      run: |
-        cd dist
-        sha256sum *.tar.gz *.zip > checksums.txt
-    
-    - name: Upload Release Assets
-      run: |
-        # Upload all archives and checksums
-        for file in dist/*.tar.gz dist/*.zip dist/checksums.txt; do
-          echo "Uploading $file..."
-          gh release upload ${{ steps.tag.outputs.tag }} "$file"
-        done
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    
-    # Optional: Build and push Docker image if you have a Dockerfile
-    # - name: Build and push Docker image
-    #   if: hashFiles('Dockerfile') != ''
-    #   run: |
-    #     # Login to GitHub Container Registry
-    #     echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-        
-    #     # Build and tag image
-    #     IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/$(basename ${{ github.repository }})"
-    #     docker build -t $IMAGE_NAME:${{ steps.tag.outputs.tag }} -t $IMAGE_NAME:latest .
-        
-    #     # Push images
-    #     docker push $IMAGE_NAME:${{ steps.tag.outputs.tag }}
-    #     docker push $IMAGE_NAME:latest
+          NOTES=$(git log "$RANGE" --pretty=format:"- %s" --no-merges)
+          BODY="## What's changed"$'\n'"${NOTES}"
+
+          BODY_JSON=$(printf '%s' "$BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+
+          RELEASE=$(curl -s -X POST "$API" \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":${BODY_JSON}}")
+
+          UPLOAD_URL=$(echo "$RELEASE" | grep -o '"upload_url":"[^"]*"' | cut -d'"' -f4)
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "Failed to create release: $RELEASE"
+            exit 1
+          fi
+
+          for f in dist/*.tar.gz dist/*.zip dist/checksums.txt; do
+            FNAME=$(basename "$f")
+            echo "Uploading $FNAME..."
+            curl -s -X POST "${UPLOAD_URL%%\{*}?name=${FNAME}" \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${f}" > /dev/null
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  pkg-aur:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          PKGVER="${VERSION#v}"
+          AUR_KEY_PATH="$HOME/.ssh/aur"
+          AUR_KNOWN_HOSTS="$HOME/.ssh/known_hosts"
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          if [ -z "${AUR_SSH_KEY:-}" ]; then
+            echo "AUR_SSH_KEY is empty"
+            exit 1
+          fi
+
+          CLEAN_AUR_SSH_KEY="$(printf '%s' "$AUR_SSH_KEY" | tr -d '\r')"
+          if printf '%s' "$CLEAN_AUR_SSH_KEY" | grep -q "^-----BEGIN .*PRIVATE KEY-----$"; then
+            printf '%s\n' "$CLEAN_AUR_SSH_KEY" > "$AUR_KEY_PATH"
+          elif printf '%s' "$CLEAN_AUR_SSH_KEY" | grep -q '\\n'; then
+            printf '%b\n' "$CLEAN_AUR_SSH_KEY" > "$AUR_KEY_PATH"
+          else
+            if printf '%s' "$CLEAN_AUR_SSH_KEY" | tr -d '[:space:]' | base64 --decode > "$AUR_KEY_PATH" 2>/dev/null; then
+              :
+            else
+              printf '%s\n' "$CLEAN_AUR_SSH_KEY" > "$AUR_KEY_PATH"
+            fi
+          fi
+          chmod 600 "$AUR_KEY_PATH"
+
+          if ! ssh-keygen -y -f "$AUR_KEY_PATH" >/dev/null 2>&1; then
+            echo "AUR_SSH_KEY is not a valid private key."
+            echo "Store it as a raw private key, an escaped private key with \\n, or a base64-encoded private key."
+            exit 1
+          fi
+
+          ssh-keyscan -t rsa,ed25519 aur.archlinux.org >> "$AUR_KNOWN_HOSTS"
+          chmod 644 "$AUR_KNOWN_HOSTS"
+
+          GIT_SSH_COMMAND="ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$AUR_KNOWN_HOSTS -i $AUR_KEY_PATH" \
+            git clone ssh://aur@aur.archlinux.org/wkmailsync.git aur-repo
+
+          CURRENT_PKGVER=$(awk -F= '/^pkgver=/ {print $2; exit}' aur-repo/PKGBUILD | tr -d "[:space:]")
+          CURRENT_PKGREL=$(awk -F= '/^pkgrel=/ {print $2; exit}' aur-repo/PKGBUILD | tr -d "[:space:]")
+
+          if [ "$CURRENT_PKGVER" = "$PKGVER" ]; then
+            case "$CURRENT_PKGREL" in
+              ''|*[!0-9]*)
+                echo "Unsupported pkgrel in AUR repo: ${CURRENT_PKGREL}"
+                exit 1
+                ;;
+              *)
+                PKGREL=$((CURRENT_PKGREL + 1))
+                ;;
+            esac
+          else
+            PKGREL=1
+          fi
+
+          echo "Publishing AUR package version ${PKGVER}-${PKGREL}"
+
+          SHA=$(curl -fsSL "https://github.com/Warky-Devs/WkMailSync/archive/v${PKGVER}.tar.gz" | sha256sum | cut -d' ' -f1)
+
+          sed -e "s/^pkgver=.*/pkgver=${PKGVER}/" \
+              -e "s/^pkgrel=.*/pkgrel=${PKGREL}/" \
+              -e "s/^sha256sums=.*/sha256sums=('${SHA}')/" \
+              installers/arch_aur/PKGBUILD > aur-repo/PKGBUILD
+
+          CID=$(docker run -d archlinux:latest sleep infinity)
+          docker cp aur-repo/PKGBUILD $CID:/build/PKGBUILD || (docker exec $CID mkdir -p /build && docker cp aur-repo/PKGBUILD $CID:/build/PKGBUILD)
+          docker exec $CID bash -c "
+            pacman -Sy --noconfirm base-devel &&
+            useradd -m builder &&
+            chown -R builder:builder /build &&
+            runuser -u builder -- bash -c 'cd /build && makepkg --printsrcinfo > .SRCINFO'
+          "
+          docker cp $CID:/build/.SRCINFO aur-repo/.SRCINFO
+          docker rm -f $CID
+
+          cd aur-repo
+          git config user.email "hein@warky.dev"
+          git config user.name "Hein"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to v${PKGVER}-${PKGREL}"
+          GIT_SSH_COMMAND="ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$AUR_KNOWN_HOSTS -i $AUR_KEY_PATH" \
+            git push origin HEAD:master
+
+  pkg-deb:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build Debian packages
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          PKGVER="${VERSION#v}"
+
+          for GOARCH in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${PKGVER}" \
+              -o wkmailsync \
+              ./cmd/wkmailsync
+
+            PKGDIR="wkmailsync_${PKGVER}_${GOARCH}"
+            mkdir -p "${PKGDIR}/DEBIAN"
+            mkdir -p "${PKGDIR}/usr/bin"
+
+            install -m755 wkmailsync "${PKGDIR}/usr/bin/wkmailsync"
+
+            sed -e "s/^Version:.*/Version: ${PKGVER}/" \
+                -e "s/^Architecture:.*/Architecture: ${GOARCH}/" \
+                installers/debian/control > "${PKGDIR}/DEBIAN/control"
+
+            dpkg-deb --build --root-owner-group "${PKGDIR}"
+            echo "Built ${PKGDIR}.deb"
+          done
+
+      - name: Upload to release
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          RELEASE=$(curl -s "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            -H "Authorization: token ${GITHUB_TOKEN}")
+          UPLOAD_URL=$(echo "$RELEASE" | grep -o '"upload_url":"[^"]*"' | cut -d'"' -f4)
+          for f in *.deb; do
+            FNAME=$(basename "$f")
+            echo "Uploading $FNAME..."
+            curl -s -X POST "${UPLOAD_URL%%\{*}?name=${FNAME}" \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${f}" > /dev/null
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  pkg-rpm:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build RPM
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          PKGVER="${VERSION#v}"
+          GO_VER="$(awk '/^go / { print $2; exit }' go.mod)"
+
+          if [ -z "${GO_VER}" ]; then
+            echo "Failed to determine Go version from go.mod"
+            exit 1
+          fi
+
+          git archive --format=tar.gz --prefix=wkmailsync-${PKGVER}/ HEAD \
+            > wkmailsync-${PKGVER}.tar.gz
+
+          sed -i "s/^Version:.*/Version:        ${PKGVER}/" installers/rpm/wkmailsync.spec
+
+          mkdir -p installers/rpm/out
+          CID=$(docker create \
+            -e GO_VER="${GO_VER}" \
+            -e PKGVER="${PKGVER}" \
+            -w /build \
+            rockylinux:9 \
+            bash -lc "
+              set -euo pipefail
+              dnf install -y rpm-build git &&
+              curl -fsSL https://go.dev/dl/go\${GO_VER}.linux-amd64.tar.gz | tar -C /usr/local -xz &&
+              export PATH=\$PATH:/usr/local/go/bin &&
+              mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS} &&
+              cp wkmailsync-${PKGVER}.tar.gz ~/rpmbuild/SOURCES/ &&
+              cp installers/rpm/wkmailsync.spec ~/rpmbuild/SPECS/ &&
+              rpmbuild --nodeps -ba ~/rpmbuild/SPECS/wkmailsync.spec
+            ")
+
+          cleanup() {
+            docker rm -f "$CID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker cp wkmailsync-${PKGVER}.tar.gz "$CID:/build/wkmailsync-${PKGVER}.tar.gz"
+          docker cp installers "$CID:/build/installers"
+
+          docker start -a "$CID"
+          docker cp "$CID:/root/rpmbuild/RPMS/." installers/rpm/out/
+
+          trap - EXIT
+          cleanup
+
+      - name: Upload to release
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          RELEASE=$(curl -s "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            -H "Authorization: token ${GITHUB_TOKEN}")
+          UPLOAD_URL=$(echo "$RELEASE" | grep -o '"upload_url":"[^"]*"' | cut -d'"' -f4)
+          for f in installers/rpm/out/**/*.rpm; do
+            FNAME=$(basename "$f")
+            echo "Uploading $FNAME..."
+            curl -s -X POST "${UPLOAD_URL%%\{*}?name=${FNAME}" \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${f}" > /dev/null
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

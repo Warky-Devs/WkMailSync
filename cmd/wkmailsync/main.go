@@ -10,6 +10,8 @@ import (
 	"github.com/Warky-Devs/WkMailSync/pkg/config"
 )
 
+var version = "dev"
+
 func main() {
 	var (
 		configFile  = flag.String("config", "", "YAML config file path")
@@ -34,10 +36,11 @@ func main() {
 		dateTo         = flag.String("date-to", "", "Only sync messages up to this date (YYYY-MM-DD)")
 		outputFormat   = flag.String("output-format", "eml", "Output format: eml or zip")
 		generateConfig = flag.String("generate-config", "", "Write example config.example.yaml and exit (imap, maildir, virtualmin)")
+		showVersion    = flag.Bool("v", false, "Print version and exit")
 	)
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "wkmailsync - IMAP/Maildir mail sync and backup tool\n\n")
+		fmt.Fprintf(os.Stderr, "wkmailsync %s - IMAP/Maildir mail sync and backup tool\n\n", version)
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  wkmailsync -config config.yaml\n")
 		fmt.Fprintf(os.Stderr, "  wkmailsync -src-host mail.example.com -src-user user -src-pass pass [flags]\n")
@@ -47,6 +50,11 @@ func main() {
 	}
 
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("wkmailsync %s\n", version)
+		os.Exit(0)
+	}
 
 	if *generateConfig != "" {
 		generateExampleConfig(*generateConfig)
