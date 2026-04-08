@@ -91,7 +91,7 @@ jobs:
             -H "Content-Type: application/json" \
             -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":${BODY_JSON}}")
 
-          UPLOAD_URL=$(echo "$RELEASE" | grep -o '"upload_url":"[^"]*"' | cut -d'"' -f4)
+          UPLOAD_URL=$(echo "$RELEASE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true)
           if [ -z "$UPLOAD_URL" ]; then
             echo "Failed to create release: $RELEASE"
             exit 1
@@ -247,7 +247,7 @@ jobs:
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           RELEASE=$(curl -s "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
             -H "Authorization: token ${GITHUB_TOKEN}")
-          UPLOAD_URL=$(echo "$RELEASE" | grep -o '"upload_url":"[^"]*"' | cut -d'"' -f4)
+          UPLOAD_URL=$(echo "$RELEASE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true)
           for f in *.deb; do
             FNAME=$(basename "$f")
             echo "Uploading $FNAME..."
@@ -321,7 +321,7 @@ jobs:
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           RELEASE=$(curl -s "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
             -H "Authorization: token ${GITHUB_TOKEN}")
-          UPLOAD_URL=$(echo "$RELEASE" | grep -o '"upload_url":"[^"]*"' | cut -d'"' -f4)
+          UPLOAD_URL=$(echo "$RELEASE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true)
           for f in installers/rpm/out/**/*.rpm; do
             FNAME=$(basename "$f")
             echo "Uploading $FNAME..."
