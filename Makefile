@@ -30,11 +30,12 @@ release-version:
 	PKGVER="$$MAJOR.$$MINOR.$$((PATCH + 1))"; \
 	echo "Current: $$CURRENT → Next: $$NEXT"; \
 	sed -i "s/^var version = .*/var version = \"$$PKGVER\"/" cmd/wkmailsync/main.go; \
-	sed -i "s/^pkgver=.*/pkgver=$$PKGVER/" installers/arch_aur/PKGBUILD; \
+	sed -i "s/^pkgver=.*/pkgver=$$PKGVER/" installers/arch/PKGBUILD; \
 	sed -i "s/^Version:.*/Version:        $$PKGVER/" installers/rpm/wkmailsync.spec; \
 	sed -i "s/^Version:.*/Version: $$PKGVER/" installers/debian/control; \
-	git add cmd/wkmailsync/main.go installers/arch_aur/PKGBUILD installers/rpm/wkmailsync.spec installers/debian/control; \
+	git add cmd/wkmailsync/main.go installers/arch/PKGBUILD installers/rpm/wkmailsync.spec installers/debian/control; \
 	git commit -m "chore(release): update package version to $$PKGVER"; \
+	git push origin HEAD; \
 	git tag -a "$$NEXT" -m "Release $$NEXT"; \
-	git push origin HEAD "$$NEXT"; \
+	git push origin "$$NEXT"; \
 	echo "Pushed $$NEXT — release workflow triggered"

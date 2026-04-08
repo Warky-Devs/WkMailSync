@@ -10,7 +10,7 @@ import (
 	"github.com/Warky-Devs/WkMailSync/pkg/config"
 )
 
-var version = "1.0.7"
+var version = "1.0.8"
 
 func main() {
 	var (

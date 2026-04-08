@@ -183,7 +183,7 @@ jobs:
           sed -e "s/^pkgver=.*/pkgver=${PKGVER}/" \
               -e "s/^pkgrel=.*/pkgrel=${PKGREL}/" \
               -e "s/^sha256sums=.*/sha256sums=('${SHA}')/" \
-              installers/arch_aur/PKGBUILD > aur-repo/PKGBUILD
+              installers/arch/PKGBUILD > aur-repo/PKGBUILD
 
           CID=$(docker run -d archlinux:latest sleep infinity)
           docker cp aur-repo/PKGBUILD $CID:/build/PKGBUILD || (docker exec $CID mkdir -p /build && docker cp aur-repo/PKGBUILD $CID:/build/PKGBUILD)
