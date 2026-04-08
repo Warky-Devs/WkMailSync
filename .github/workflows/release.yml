@@ -93,7 +93,14 @@ jobs:
 
           UPLOAD_URL=$(echo "$RELEASE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true)
           if [ -z "$UPLOAD_URL" ]; then
-            echo "Failed to create release: $RELEASE"
+            echo "Release creation returned: $RELEASE"
+            echo "Checking for existing release..."
+            RELEASE=$(curl -s "${API}/tags/${TAG}" \
+              -H "Authorization: token ${GITHUB_TOKEN}")
+            UPLOAD_URL=$(echo "$RELEASE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true)
+          fi
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "Failed to get release upload URL: $RELEASE"
             exit 1
           fi
 

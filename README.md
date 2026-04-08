@@ -1,5 +1,7 @@
 # WkMailSync
 
+> LLM/AI usage guide: [llm.md](llm.md)
+
 Mail synchronization and backup tool in Go. Syncs IMAP→IMAP, IMAP→EML, Maildir→EML/Zip, or bulk-exports all users from a Virtualmin server.
 
 ## Features
