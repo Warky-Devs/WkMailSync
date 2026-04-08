@@ -5,7 +5,7 @@ Release:        1%{?dist}
 Summary:        Mail synchronization and backup tool - IMAP/Maildir sync and export
 License:        GPL-3.0-only
 URL:            https://github.com/Warky-Devs/WkMailSync
-Source0:        %{url}/archive/v%{version}/WkMailSync-%{version}.tar.gz
+Source0:        %{url}/archive/v%{version}/wkmailsync-%{version}.tar.gz
 
 BuildRequires:  golang >= 1.22.0
 

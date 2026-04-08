@@ -1,15 +1,9 @@
-Source: wkmailsync
-Section: utils
-Priority: optional
-Maintainer: Hein Puth (Warky Devs)
-Build-Depends: debhelper-compat (= 13), golang-go (>= 1.22.0)
-Standards-Version: 4.6.2
-Homepage: https://github.com/Warky-Devs/WkMailSync
-
 Package: wkmailsync
 Version: 1.0.8
 Architecture: amd64
+Maintainer: Hein Puth (Warky Devs)
+Homepage: https://github.com/Warky-Devs/WkMailSync
 Depends: ${misc:Depends}
 Description: Mail synchronization and backup tool
  Supports IMAP-to-IMAP, IMAP-to-EML, Maildir-to-EML/Zip,
- and Virtualmin bulk export. Binary installed as WKMailSync.
+ and Virtualmin bulk export.
