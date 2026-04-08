@@ -1,6 +1,6 @@
 # Maintainer: Hein Puth (Warky Devs)
 Name:           wkmailsync
-Version:        1.0.8
+Version:        1.0.9
 Release:        1%{?dist}
 Summary:        Mail synchronization and backup tool - IMAP/Maildir sync and export
 License:        GPL-3.0-only
