@@ -86,19 +86,27 @@ jobs:
 
           BODY_JSON=$(printf '%s' "$BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
 
+          get_upload_url() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true; }
+
           RELEASE=$(curl -s -X POST "$API" \
             -H "Authorization: token ${GITHUB_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":${BODY_JSON}}")
+          UPLOAD_URL=$(echo "$RELEASE" | get_upload_url)
 
-          UPLOAD_URL=$(echo "$RELEASE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true)
           if [ -z "$UPLOAD_URL" ]; then
-            echo "Release creation returned: $RELEASE"
-            echo "Checking for existing release..."
-            RELEASE=$(curl -s "${API}/tags/${TAG}" \
-              -H "Authorization: token ${GITHUB_TOKEN}")
-            UPLOAD_URL=$(echo "$RELEASE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true)
+            echo "Create returned: $RELEASE"
+            echo "Fetching existing release by tag..."
+            RELEASE=$(curl -s "${API}/tags/${TAG}" -H "Authorization: token ${GITHUB_TOKEN}")
+            UPLOAD_URL=$(echo "$RELEASE" | get_upload_url)
           fi
+
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "Searching release list (handles drafts)..."
+            RELEASE=$(curl -s "${API}?per_page=100" -H "Authorization: token ${GITHUB_TOKEN}" | python3 -c "import json,sys; rs=json.load(sys.stdin); r=next((r for r in rs if r.get('tag_name')=='${TAG}'),{}); print(json.dumps(r))" 2>/dev/null || true)
+            UPLOAD_URL=$(echo "$RELEASE" | get_upload_url)
+          fi
+
           if [ -z "$UPLOAD_URL" ]; then
             echo "Failed to get release upload URL: $RELEASE"
             exit 1
