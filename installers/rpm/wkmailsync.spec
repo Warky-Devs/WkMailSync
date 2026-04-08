@@ -1,4 +1,5 @@
 # Maintainer: Hein Puth (Warky Devs)
+%global debug_package %{nil}
 Name:           wkmailsync
 Version:        1.0.9
 Release:        1%{?dist}
@@ -30,5 +31,5 @@ install -Dm755 %{name} %{buildroot}%{_bindir}/%{name}
 %{_bindir}/%{name}
 
 %changelog
-* Thu Mar 13 2026 Hein Puth (Warky Devs) - 1.0.3-1
+* Thu Mar 13 2025 Hein Puth (Warky Devs) - 1.0.3-1
 - Initial package

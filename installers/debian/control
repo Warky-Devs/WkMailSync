@@ -3,7 +3,6 @@ Version: 1.0.9
 Architecture: amd64
 Maintainer: Hein Puth (Warky Devs)
 Homepage: https://github.com/Warky-Devs/WkMailSync
-Depends: ${misc:Depends}
 Description: Mail synchronization and backup tool
  Supports IMAP-to-IMAP, IMAP-to-EML, Maildir-to-EML/Zip,
  and Virtualmin bulk export.
