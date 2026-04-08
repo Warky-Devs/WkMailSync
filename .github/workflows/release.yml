@@ -329,13 +329,13 @@ jobs:
           RELEASE=$(curl -s "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
             -H "Authorization: token ${GITHUB_TOKEN}")
           UPLOAD_URL=$(echo "$RELEASE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true)
-          for f in installers/rpm/out/**/*.rpm; do
+          while IFS= read -r f; do
             FNAME=$(basename "$f")
             echo "Uploading $FNAME..."
             curl -s -X POST "${UPLOAD_URL%%\{*}?name=${FNAME}" \
               -H "Authorization: token ${GITHUB_TOKEN}" \
               -H "Content-Type: application/octet-stream" \
               --data-binary "@${f}" > /dev/null
-          done
+          done < <(find installers/rpm/out -name "*.rpm")
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
