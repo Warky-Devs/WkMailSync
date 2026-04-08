@@ -73,7 +73,6 @@ jobs:
       - name: Create release and upload assets
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          API="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases"
 
           PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -1)
           if [ -n "$PREV_TAG" ]; then
@@ -84,44 +83,12 @@ jobs:
           NOTES=$(git log "$RANGE" --pretty=format:"- %s" --no-merges)
           BODY="## What's changed"$'\n'"${NOTES}"
 
-          BODY_JSON=$(printf '%s' "$BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
-
-          get_upload_url() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true; }
-
-          RELEASE=$(curl -s -X POST "$API" \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":${BODY_JSON}}")
-          UPLOAD_URL=$(echo "$RELEASE" | get_upload_url)
-
-          if [ -z "$UPLOAD_URL" ]; then
-            echo "Create returned: $RELEASE"
-            echo "Fetching existing release by tag..."
-            RELEASE=$(curl -s "${API}/tags/${TAG}" -H "Authorization: token ${GITHUB_TOKEN}")
-            UPLOAD_URL=$(echo "$RELEASE" | get_upload_url)
-          fi
-
-          if [ -z "$UPLOAD_URL" ]; then
-            echo "Searching release list (handles drafts)..."
-            RELEASE=$(curl -s "${API}?per_page=100" -H "Authorization: token ${GITHUB_TOKEN}" | python3 -c "import json,sys; rs=json.load(sys.stdin); r=next((r for r in rs if r.get('tag_name')=='${TAG}'),{}); print(json.dumps(r))" 2>/dev/null || true)
-            UPLOAD_URL=$(echo "$RELEASE" | get_upload_url)
-          fi
-
-          if [ -z "$UPLOAD_URL" ]; then
-            echo "Failed to get release upload URL: $RELEASE"
-            exit 1
-          fi
-
-          for f in dist/*.tar.gz dist/*.zip dist/checksums.txt; do
-            FNAME=$(basename "$f")
-            echo "Uploading $FNAME..."
-            curl -s -X POST "${UPLOAD_URL%%\{*}?name=${FNAME}" \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
-              -H "Content-Type: application/octet-stream" \
-              --data-binary "@${f}" > /dev/null
-          done
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --notes "${BODY}" \
+            dist/*.tar.gz dist/*.zip dist/checksums.txt
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   pkg-aur:
     needs: release
@@ -260,19 +227,9 @@ jobs:
       - name: Upload to release
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          RELEASE=$(curl -s "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
-            -H "Authorization: token ${GITHUB_TOKEN}")
-          UPLOAD_URL=$(echo "$RELEASE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true)
-          for f in *.deb; do
-            FNAME=$(basename "$f")
-            echo "Uploading $FNAME..."
-            curl -s -X POST "${UPLOAD_URL%%\{*}?name=${FNAME}" \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
-              -H "Content-Type: application/octet-stream" \
-              --data-binary "@${f}" > /dev/null
-          done
+          gh release upload "${TAG}" *.deb
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   pkg-rpm:
     needs: release
@@ -334,16 +291,6 @@ jobs:
       - name: Upload to release
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          RELEASE=$(curl -s "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
-            -H "Authorization: token ${GITHUB_TOKEN}")
-          UPLOAD_URL=$(echo "$RELEASE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("upload_url",""))' 2>/dev/null || true)
-          while IFS= read -r f; do
-            FNAME=$(basename "$f")
-            echo "Uploading $FNAME..."
-            curl -s -X POST "${UPLOAD_URL%%\{*}?name=${FNAME}" \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
-              -H "Content-Type: application/octet-stream" \
-              --data-binary "@${f}" > /dev/null
-          done < <(find installers/rpm/out -name "*.rpm")
+          gh release upload "${TAG}" $(find installers/rpm/out -name "*.rpm")
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
