@@ -12,6 +12,7 @@ type Message struct {
 	Date      time.Time
 	Flags     []string
 	Content   []byte
+	UID       uint32
 }
 
 type Folder struct {
@@ -21,8 +22,8 @@ type Folder struct {
 type MailSource interface {
 	ListFolders() ([]Folder, error)
 	// Messages streams messages in the folder one at a time.
-	// The caller ranges over the iterator; each yield is (Message, error).
-	// A non-nil error signals a fatal read failure for that item.
-	Messages(folder Folder) iter.Seq2[Message, error]
+	// afterUID, when non-zero, skips messages with UID ≤ afterUID (IMAP only;
+	// non-IMAP sources ignore it and yield all messages).
+	Messages(folder Folder, afterUID uint32) iter.Seq2[Message, error]
 	Close() error
 }

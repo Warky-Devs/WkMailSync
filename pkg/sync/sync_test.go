@@ -22,7 +22,7 @@ func (f *fakeSource) ListFolders() ([]source.Folder, error) {
 	return f.folders, f.listErr
 }
 
-func (f *fakeSource) Messages(folder source.Folder) iter.Seq2[source.Message, error] {
+func (f *fakeSource) Messages(folder source.Folder, _ uint32) iter.Seq2[source.Message, error] {
 	return func(yield func(source.Message, error) bool) {
 		if f.msgErr != nil {
 			yield(source.Message{}, f.msgErr)

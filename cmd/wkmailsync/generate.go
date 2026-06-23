@@ -73,8 +73,52 @@ func generateExampleConfig(mode string) {
 			DateTo:       "2024-12-31",
 		}
 
+	case "gmail":
+		cfg = config.Config{
+			Source: config.ServerConfig{
+				Host:     "imap.gmail.com",
+				Port:     "993",
+				Username: "user@gmail.com",
+				UseTLS:   true,
+				OAuth2: &config.OAuth2Config{
+					ClientID:     "xxxx.apps.googleusercontent.com",
+					ClientSecret: "GOCSPX-...",
+					RefreshToken: "1//0g...",
+				},
+			},
+			OutputDir:     "/backup/gmail",
+			OutputFormat:  "eml",
+			FolderExclude: []string{"[Gmail]/Spam", "[Gmail]/Trash"},
+		}
+
+	case "monitor":
+		includeBody := true
+		cfg = config.Config{
+			Monitor: &config.MonitorConfig{
+				Source: config.MonitorServerConfig{
+					Host:     "imap.gmail.com",
+					Port:     "993",
+					Username: "user@gmail.com",
+					UseTLS:   true,
+					OAuth2: &config.OAuth2Config{
+						ClientID:     "xxxx.apps.googleusercontent.com",
+						ClientSecret: "GOCSPX-...",
+						RefreshToken: "1//0g...",
+					},
+				},
+				OutputDir:     "/backup/monitored",
+				FolderExclude: []string{"Spam", "Trash"},
+				Webhook: &config.WebhookConfig{
+					Enabled:     false,
+					URL:         "https://example.com/hook",
+					IncludeBody: &includeBody,
+					TimeoutSec:  30,
+				},
+			},
+		}
+
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown config type %q. Choose: imap, maildir, virtualmin\n", mode)
+		fmt.Fprintf(os.Stderr, "Unknown config type %q. Choose: imap, gmail, maildir, virtualmin, monitor\n", mode)
 		os.Exit(1)
 	}
 

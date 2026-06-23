@@ -30,6 +30,7 @@ func runIMAPSync(cfg *config.Config, dateFrom, dateTo time.Time) {
 	engine.DryRun = cfg.DryRun
 	engine.FolderInclude = cfg.FolderInclude
 	engine.FolderExclude = cfg.FolderExclude
+	engine.StateFile = resolveStateFile(cfg)
 
 	if err := engine.Run(); err != nil {
 		log.Fatalf("Sync failed: %v", err)
@@ -80,6 +81,16 @@ func runEngineForUser(src source.MailSource, out output.MailOutput, cfg *config.
 		return
 	}
 	engine.PrintStats()
+}
+
+func resolveStateFile(cfg *config.Config) string {
+	if cfg.StateFile != "" {
+		return cfg.StateFile
+	}
+	if cfg.OutputDir != "" {
+		return cfg.OutputDir + "/.wksync_state.json"
+	}
+	return ""
 }
 
 func buildOutput(cfg *config.Config, username string) (output.MailOutput, error) {

@@ -189,7 +189,7 @@ func (ms *SSHMaildirSource) ListFolders() ([]source.Folder, error) {
 	return folders, nil
 }
 
-func (ms *SSHMaildirSource) Messages(folder source.Folder) iter.Seq2[source.Message, error] {
+func (ms *SSHMaildirSource) Messages(folder source.Folder, _ uint32) iter.Seq2[source.Message, error] {
 	return func(yield func(source.Message, error) bool) {
 		var dirPath string
 		if folder.Name == "INBOX" {

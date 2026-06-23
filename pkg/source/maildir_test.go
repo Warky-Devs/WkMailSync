@@ -11,7 +11,7 @@ import (
 func collectMessages(src MailSource, folder Folder) ([]Message, error) {
 	var msgs []Message
 	var firstErr error
-	for msg, err := range src.Messages(folder) {
+	for msg, err := range src.Messages(folder, 0) {
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err

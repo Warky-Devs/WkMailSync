@@ -50,7 +50,7 @@ func (s *MaildirSource) ListFolders() ([]Folder, error) {
 	return folders, nil
 }
 
-func (s *MaildirSource) Messages(folder Folder) iter.Seq2[Message, error] {
+func (s *MaildirSource) Messages(folder Folder, _ uint32) iter.Seq2[Message, error] {
 	return func(yield func(Message, error) bool) {
 		var dirPath string
 		if folder.Name == "INBOX" {

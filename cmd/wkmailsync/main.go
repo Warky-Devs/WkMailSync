@@ -35,8 +35,10 @@ func main() {
 		dateFrom       = flag.String("date-from", "", "Only sync messages from this date (YYYY-MM-DD)")
 		dateTo         = flag.String("date-to", "", "Only sync messages up to this date (YYYY-MM-DD)")
 		outputFormat   = flag.String("output-format", "eml", "Output format: eml or zip")
-		generateConfig = flag.String("generate-config", "", "Write example config.example.yaml and exit (imap, maildir, virtualmin)")
+		generateConfig = flag.String("generate-config", "", "Write example config.example.yaml and exit (imap, gmail, maildir, virtualmin, monitor)")
 		showVersion    = flag.Bool("v", false, "Print version and exit")
+		monitorMode    = flag.Bool("monitor", false, "Run in monitor mode (requires monitor: in config)")
+		gmailAuth      = flag.Bool("gmail-auth", false, "Run Gmail OAuth2 setup wizard and print refresh_token")
 	)
 
 	flag.Usage = func() {
@@ -44,7 +46,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  wkmailsync -config config.yaml\n")
 		fmt.Fprintf(os.Stderr, "  wkmailsync -src-host mail.example.com -src-user user -src-pass pass [flags]\n")
-		fmt.Fprintf(os.Stderr, "  wkmailsync -generate-config [imap|maildir|virtualmin]\n\n")
+		fmt.Fprintf(os.Stderr, "  wkmailsync -generate-config [imap|gmail|maildir|virtualmin|monitor]\n")
+		fmt.Fprintf(os.Stderr, "  wkmailsync -config config.yaml -monitor\n")
+		fmt.Fprintf(os.Stderr, "  wkmailsync -config config.yaml -gmail-auth\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 	}
@@ -59,6 +63,14 @@ func main() {
 	if *generateConfig != "" {
 		generateExampleConfig(*generateConfig)
 		os.Exit(0)
+	}
+
+	// gmail-auth and monitor both require a config file.
+	if (*gmailAuth || *monitorMode) && *configFile == "" {
+		fmt.Fprintf(os.Stderr, "Error: -config is required with -%s\n\n",
+			map[bool]string{true: "gmail-auth", false: "monitor"}[*gmailAuth])
+		flag.Usage()
+		os.Exit(1)
 	}
 
 	var cfg *config.Config
@@ -99,6 +111,16 @@ func main() {
 			DateTo:       *dateTo,
 			OutputFormat: *outputFormat,
 		}
+	}
+
+	if *gmailAuth {
+		runGmailAuth(cfg)
+		return
+	}
+
+	if *monitorMode {
+		runMonitor(cfg)
+		return
 	}
 
 	var dateFromParsed, dateToParsed time.Time

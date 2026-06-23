@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"iter"
 	"log"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -36,6 +39,50 @@ func init() {
 	charset.RegisterEncoding("LATIN1", charmap.ISO8859_1)
 }
 
+// xoauth2Client implements the SASL XOAUTH2 mechanism for IMAP.
+type xoauth2Client struct {
+	username string
+	token    string
+}
+
+func (x *xoauth2Client) Start() (string, []byte, error) {
+	ir := []byte("user=" + x.username + "\x01auth=Bearer " + x.token + "\x01\x01")
+	return "XOAUTH2", ir, nil
+}
+
+// Next acknowledges a server challenge (error JSON on auth failure) so the server can reply with NO.
+func (x *xoauth2Client) Next(_ []byte) ([]byte, error) {
+	return []byte{}, nil
+}
+
+func fetchAccessToken(cfg *config.OAuth2Config) (string, error) {
+	resp, err := http.PostForm("https://oauth2.googleapis.com/token", url.Values{
+		"client_id":     {cfg.ClientID},
+		"client_secret": {cfg.ClientSecret},
+		"refresh_token": {cfg.RefreshToken},
+		"grant_type":    {"refresh_token"},
+	})
+	if err != nil {
+		return "", fmt.Errorf("token refresh: %v", err)
+	}
+	defer resp.Body.Close()
+	var tr struct {
+		AccessToken string `json:"access_token"`
+		Error       string `json:"error"`
+		ErrorDesc   string `json:"error_description"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+		return "", fmt.Errorf("decode token response: %v", err)
+	}
+	if tr.Error != "" {
+		return "", fmt.Errorf("token refresh %s: %s", tr.Error, tr.ErrorDesc)
+	}
+	if tr.AccessToken == "" {
+		return "", fmt.Errorf("empty access token in response")
+	}
+	return tr.AccessToken, nil
+}
+
 type IMAPSource struct {
 	client  *imapClient.Client
 	cfg     config.ServerConfig
@@ -62,9 +109,21 @@ func Connect(cfg config.ServerConfig) (*imapClient.Client, error) {
 		return nil, err
 	}
 
-	if err := c.Login(cfg.Username, cfg.Password); err != nil {
-		c.Logout()
-		return nil, err
+	if cfg.OAuth2 != nil {
+		token, err := fetchAccessToken(cfg.OAuth2)
+		if err != nil {
+			c.Logout()
+			return nil, fmt.Errorf("OAuth2 token: %v", err)
+		}
+		if err := c.Authenticate(&xoauth2Client{username: cfg.Username, token: token}); err != nil {
+			c.Logout()
+			return nil, fmt.Errorf("OAuth2 auth: %v", err)
+		}
+	} else {
+		if err := c.Login(cfg.Username, cfg.Password); err != nil {
+			c.Logout()
+			return nil, err
+		}
 	}
 
 	return c, nil
@@ -124,7 +183,15 @@ func (s *IMAPSource) ListFolders() ([]Folder, error) {
 	return folders, nil
 }
 
-func (s *IMAPSource) Messages(folder Folder) iter.Seq2[Message, error] {
+var imapFetchItems = []imap.FetchItem{
+	imap.FetchUid,
+	imap.FetchEnvelope,
+	imap.FetchRFC822,
+	imap.FetchFlags,
+	imap.FetchInternalDate,
+}
+
+func (s *IMAPSource) Messages(folder Folder, afterUID uint32) iter.Seq2[Message, error] {
 	return func(yield func(Message, error) bool) {
 		mbox, err := s.client.Select(folder.Name, true)
 		if err != nil {
@@ -135,94 +202,143 @@ func (s *IMAPSource) Messages(folder Folder) iter.Seq2[Message, error] {
 			return
 		}
 
-		const batchSize = 100
-		for start := uint32(1); start <= mbox.Messages; start += batchSize {
-			end := start + batchSize - 1
-			if end > mbox.Messages {
-				end = mbox.Messages
-			}
+		if afterUID > 0 {
+			s.fetchByUID(folder, afterUID, yield)
+			return
+		}
+		s.fetchBySeq(mbox.Messages, yield)
+	}
+}
 
-			seqset := new(imap.SeqSet)
-			seqset.AddRange(start, end)
+// fetchByUID fetches only messages with UID > afterUID using UID SEARCH + UID FETCH.
+func (s *IMAPSource) fetchByUID(folder Folder, afterUID uint32, yield func(Message, error) bool) {
+	criteria := &imap.SearchCriteria{Uid: new(imap.SeqSet)}
+	criteria.Uid.AddRange(afterUID+1, 0)
+	uids, err := s.client.UidSearch(criteria)
+	if err != nil {
+		yield(Message{}, fmt.Errorf("UID SEARCH %s: %v", folder.Name, err))
+		return
+	}
+	if len(uids) == 0 {
+		return
+	}
 
-			ch := make(chan *imap.Message, int(end-start+1)+10)
-			done := make(chan error, 1)
-			go func() {
-				done <- s.client.Fetch(seqset, []imap.FetchItem{
-					imap.FetchEnvelope,
-					imap.FetchRFC822,
-					imap.FetchFlags,
-					imap.FetchInternalDate,
-				}, ch)
-			}()
-
-			// Drain the channel first to avoid deadlocking the IMAP fetch goroutine
-			var batch []*imap.Message
-			for msg := range ch {
-				batch = append(batch, msg)
-			}
-			if err := <-done; err != nil {
-				yield(Message{}, fmt.Errorf("failed to fetch messages: %v", err))
+	const batchSize = 100
+	for i := 0; i < len(uids); i += batchSize {
+		end := i + batchSize
+		if end > len(uids) {
+			end = len(uids)
+		}
+		seqset := new(imap.SeqSet)
+		for _, uid := range uids[i:end] {
+			seqset.AddNum(uid)
+		}
+		ch := make(chan *imap.Message, end-i+10)
+		done := make(chan error, 1)
+		go func() {
+			done <- s.client.UidFetch(seqset, imapFetchItems, ch)
+		}()
+		var batch []*imap.Message
+		for msg := range ch {
+			batch = append(batch, msg)
+		}
+		if err := <-done; err != nil {
+			yield(Message{}, fmt.Errorf("UID FETCH %s: %v", folder.Name, err))
+			return
+		}
+		for _, msg := range batch {
+			if !yieldImapMessage(msg, yield) {
 				return
-			}
-
-			for _, msg := range batch {
-				if msg.Envelope == nil {
-					continue
-				}
-				content, err := extractRawContent(msg)
-				if err != nil {
-					log.Printf("  Failed to extract content for message %v: %v", msg.SeqNum, err)
-					continue
-				}
-
-				messageID := msg.Envelope.MessageId
-				if messageID == "" {
-					date := msg.InternalDate
-					if date.IsZero() && !msg.Envelope.Date.IsZero() {
-						date = msg.Envelope.Date
-					}
-					if date.IsZero() {
-						date = time.Now()
-					}
-					subject := msg.Envelope.Subject
-					if subject == "" {
-						subject = "(no subject)"
-					}
-					h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d-%d", subject, date.Unix(), msg.SeqNum)))
-					messageID = fmt.Sprintf("<%x@wkmailsync.generated>", h[:8])
-				}
-
-				from := ""
-				if len(msg.Envelope.From) > 0 {
-					if msg.Envelope.From[0].PersonalName != "" {
-						from = msg.Envelope.From[0].PersonalName
-					} else if msg.Envelope.From[0].MailboxName != "" {
-						from = msg.Envelope.From[0].MailboxName
-					}
-				}
-
-				date := msg.InternalDate
-				if date.IsZero() && !msg.Envelope.Date.IsZero() {
-					date = msg.Envelope.Date
-				}
-				if date.IsZero() {
-					date = time.Now()
-				}
-
-				if !yield(Message{
-					MessageID: messageID,
-					Subject:   msg.Envelope.Subject,
-					From:      from,
-					Date:      date,
-					Flags:     msg.Flags,
-					Content:   content,
-				}, nil) {
-					return
-				}
 			}
 		}
 	}
+}
+
+// fetchBySeq fetches all messages using sequence-number batches (used on first run).
+func (s *IMAPSource) fetchBySeq(total uint32, yield func(Message, error) bool) {
+	const batchSize = 100
+	for start := uint32(1); start <= total; start += batchSize {
+		end := start + batchSize - 1
+		if end > total {
+			end = total
+		}
+		seqset := new(imap.SeqSet)
+		seqset.AddRange(start, end)
+
+		ch := make(chan *imap.Message, int(end-start+1)+10)
+		done := make(chan error, 1)
+		go func() {
+			done <- s.client.Fetch(seqset, imapFetchItems, ch)
+		}()
+		var batch []*imap.Message
+		for msg := range ch {
+			batch = append(batch, msg)
+		}
+		if err := <-done; err != nil {
+			yield(Message{}, fmt.Errorf("failed to fetch messages: %v", err))
+			return
+		}
+		for _, msg := range batch {
+			if !yieldImapMessage(msg, yield) {
+				return
+			}
+		}
+	}
+}
+
+func yieldImapMessage(msg *imap.Message, yield func(Message, error) bool) bool {
+	if msg == nil || msg.Envelope == nil {
+		return true
+	}
+	content, err := extractRawContent(msg)
+	if err != nil {
+		log.Printf("  Failed to extract content for message %v: %v", msg.SeqNum, err)
+		return true
+	}
+
+	messageID := msg.Envelope.MessageId
+	if messageID == "" {
+		date := msg.InternalDate
+		if date.IsZero() && !msg.Envelope.Date.IsZero() {
+			date = msg.Envelope.Date
+		}
+		if date.IsZero() {
+			date = time.Now()
+		}
+		subject := msg.Envelope.Subject
+		if subject == "" {
+			subject = "(no subject)"
+		}
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d-%d", subject, date.Unix(), msg.SeqNum)))
+		messageID = fmt.Sprintf("<%x@wkmailsync.generated>", h[:8])
+	}
+
+	from := ""
+	if len(msg.Envelope.From) > 0 {
+		if msg.Envelope.From[0].PersonalName != "" {
+			from = msg.Envelope.From[0].PersonalName
+		} else if msg.Envelope.From[0].MailboxName != "" {
+			from = msg.Envelope.From[0].MailboxName
+		}
+	}
+
+	date := msg.InternalDate
+	if date.IsZero() && !msg.Envelope.Date.IsZero() {
+		date = msg.Envelope.Date
+	}
+	if date.IsZero() {
+		date = time.Now()
+	}
+
+	return yield(Message{
+		UID:       msg.Uid,
+		MessageID: messageID,
+		Subject:   msg.Envelope.Subject,
+		From:      from,
+		Date:      date,
+		Flags:     msg.Flags,
+		Content:   content,
+	}, nil)
 }
 
 func (s *IMAPSource) Close() error {
